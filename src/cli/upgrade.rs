@@ -5497,7 +5497,7 @@ fn candidate_codex_preflight_json_is_unsupported(value: &Value, stderr: &str) ->
             .is_some_and(|value| value.as_u64() != Some(0))
         || object
             .get("checksSkipped")
-            .is_some_and(|value| value.as_u64() != Some(1))
+            .is_some_and(|value| value.as_u64().is_none())
     {
         return false;
     }
@@ -6023,6 +6023,12 @@ mod tests {
             r#"{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
             ""
         ));
+        for checks_skipped in [0, 4] {
+            let output = format!(
+                r#"{{"ok":false,"checksRun":0,"checksSkipped":{checks_skipped},"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}}]}}"#
+            );
+            assert!(candidate_codex_preflight_is_unsupported(&output, ""));
+        }
         assert!(candidate_codex_preflight_is_unsupported(
             "",
             "error: unknown option '--lint'"
@@ -6049,6 +6055,10 @@ mod tests {
         ));
         assert!(!candidate_codex_preflight_is_unsupported(
             r#"{"ok":true,"checksRun":1,"checksSkipped":0,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"checksRun":0,"checksSkipped":"4","findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
             ""
         ));
         assert!(!candidate_codex_preflight_is_unsupported(
