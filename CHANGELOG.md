@@ -18,6 +18,7 @@ All notable changes to OCM are documented here.
 
 ### Added
 
+- Make `ocm self update` a recoverable local transaction that retains the previous executable, survives caller disconnection, refreshes a running daemon, checks gateway recovery, and records a durable result. Add `--status` and `--recover` for interrupted updates.
 - Prepare `@openclaw/ocm` npm distribution of signed Rust binaries, with a
   no-download launcher, exact platform aliases, and manual OIDC publishing.
   Include every npm CI lane in automatic-release verification.

@@ -1,5 +1,7 @@
 mod support;
 
+use std::io::{Seek, SeekFrom, Write};
+
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
@@ -12,14 +14,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path};
+use fs2::FileExt;
+use ocm::env::{EnvDevMeta, EnvironmentService};
+use ocm::store::{
+    env_registry_path, get_environment, now_utc, save_environment, source_watch_override_path,
+    supervisor_runtime_path,
+};
 use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_launchctl, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script, write_text,
+    write_executable_script, write_json_replacing_path, write_text,
 };
 
 fn write_running_snapshot_service(
@@ -36,6 +43,7 @@ fn write_running_snapshot_service(
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: env.get("OCM_HOME").unwrap().clone(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "source".to_string(),
@@ -64,7 +72,7 @@ fn write_running_snapshot_service(
             stderr_path,
         }],
     };
-    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    write_json_replacing_path(&runtime_path, &runtime);
 }
 
 fn write_empty_snapshot_service(runtime_path: &Path, ocm_home: &str) {
@@ -72,11 +80,12 @@ fn write_empty_snapshot_service(runtime_path: &Path, ocm_home: &str) {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),
     };
-    fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    write_json_replacing_path(runtime_path, &runtime);
 }
 
 #[test]
@@ -339,6 +348,423 @@ fn env_snapshot_restore_reverts_state_from_the_selected_snapshot() {
             .unwrap(),
         "before restore"
     );
+}
+
+#[test]
+fn env_snapshot_restore_preserves_the_current_complete_dev_binding() {
+    for binding in ["runtime", "launcher", "dev", "ordinary"] {
+        let root = TestDir::new("env-snapshot-dev-binding");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let created = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        for name in ["captured", "current"] {
+            let binary = root.child(format!("{name}-openclaw"));
+            write_executable_script(&binary, "#!/bin/sh\nexit 0\n");
+            let runtime = run_ocm(
+                &cwd,
+                &env,
+                &["runtime", "add", name, "--path", &path_string(&binary)],
+            );
+            assert!(runtime.status.success(), "{}", stderr(&runtime));
+            let launcher = run_ocm(
+                &cwd,
+                &env,
+                &["launcher", "add", name, "--command", "printf retained"],
+            );
+            assert!(launcher.status.success(), "{}", stderr(&launcher));
+        }
+        let mut meta = get_environment("source", &env, &cwd).unwrap();
+        meta.service_enabled = false;
+        meta.service_running = false;
+        meta.default_runtime = Some("captured".to_string());
+        meta.default_launcher = Some("captured".to_string());
+        save_environment(meta, &env, &cwd).unwrap();
+        let notes = root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt");
+        write_text(&notes, "snapshot state\n");
+        let snapshot = run_ocm(
+            &cwd,
+            &env,
+            &["env", "snapshot", "create", "source", "--json"],
+        );
+        assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+        let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+
+        let mut current = get_environment("source", &env, &cwd).unwrap();
+        if binding != "ordinary" {
+            current.dev = Some(EnvDevMeta::Owned {
+                repo_root: path_string(&root.child("saved-repo")),
+                worktree_root: path_string(&root.child("saved-worktree")),
+            });
+            if binding == "dev" {
+                let repo = Path::new(current.dev.as_ref().unwrap().repo_root());
+                write_text(&repo.join("package.json"), r#"{"name":"openclaw"}"#);
+                write_text(&repo.join("scripts/run-node.mjs"), "");
+                for args in [
+                    vec!["init"],
+                    vec!["add", "."],
+                    vec![
+                        "-c",
+                        "user.name=OCM Tests",
+                        "-c",
+                        "user.email=tests@example.com",
+                        "commit",
+                        "-m",
+                        "fixture",
+                    ],
+                    vec!["worktree", "add", "--detach", "../saved-worktree"],
+                ] {
+                    let output = Command::new("git")
+                        .arg("-C")
+                        .arg(repo)
+                        .args(args)
+                        .env_clear()
+                        .envs(&env)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "{}", stderr(&output));
+                }
+            }
+        }
+        current.default_runtime =
+            matches!(binding, "runtime" | "ordinary").then(|| "current".to_string());
+        current.default_launcher = (binding != "dev").then(|| "current".to_string());
+        save_environment(current.clone(), &env, &cwd).unwrap();
+        write_text(&notes, "current state\n");
+        let restored = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "snapshot",
+                "restore",
+                "source",
+                snapshot["id"].as_str().unwrap(),
+            ],
+        );
+        assert!(
+            restored.status.success(),
+            "{binding}: {}",
+            stderr(&restored)
+        );
+        let restored = get_environment("source", &env, &cwd).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.dev).unwrap(),
+            serde_json::to_value(&current.dev).unwrap()
+        );
+        let expected = if binding == "ordinary" {
+            "captured"
+        } else {
+            "current"
+        };
+        assert_eq!(
+            restored.default_runtime.as_deref(),
+            if matches!(binding, "runtime" | "ordinary") {
+                Some(expected)
+            } else {
+                None
+            }
+        );
+        assert_eq!(
+            restored.default_launcher.as_deref(),
+            (binding != "dev").then_some(expected)
+        );
+        assert_eq!(fs::read_to_string(&notes).unwrap(), "snapshot state\n");
+        let resolved = EnvironmentService::new(&env, &cwd)
+            .resolve("source", None, None, &["status".to_string()])
+            .unwrap()
+            .into_summary();
+        assert_eq!(
+            resolved.binding_kind,
+            if binding == "ordinary" {
+                "runtime"
+            } else {
+                binding
+            }
+        );
+        assert_eq!(
+            resolved.binding_name,
+            if binding == "dev" { "dev" } else { expected }
+        );
+        if binding == "dev" {
+            assert_eq!(
+                resolved.run_dir,
+                current.dev.as_ref().unwrap().source_root()
+            );
+        }
+    }
+}
+
+#[test]
+fn env_snapshot_restore_refuses_active_transitional_and_unknown_dev_ownership() {
+    let root = TestDir::new("env-snapshot-watch-ownership");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let created = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let mut meta = get_environment("source", &env, &cwd).unwrap();
+    meta.service_enabled = false;
+    meta.service_running = false;
+    save_environment(meta.clone(), &env, &cwd).unwrap();
+    let notes = root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt");
+    write_text(&notes, "snapshot state\n");
+    let snapshot = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "create", "source", "--json"],
+    );
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+    let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    write_text(&notes, "current state\n");
+    let registry_before = fs::read(env_registry_path(&env, &cwd).unwrap()).unwrap();
+    let checkout = root.child("watched-source");
+    fs::create_dir_all(checkout.join("extensions")).unwrap();
+    fs::write(checkout.join("openclaw.mjs"), "fixture\n").unwrap();
+    let override_path = source_watch_override_path("source", &env, &cwd).unwrap();
+    fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+    let session_path = override_path.with_extension("session");
+    let unfinished = serde_json::json!({
+        "kind": "ocm-source-watch-session", "envName": "source",
+        "leaseId": "snapshot-fixture", "envRoot": meta.root,
+        "envCreatedAt": serde_json::to_value(&meta).unwrap()["createdAt"],
+        "processScope": null, "controller": {"pid": std::process::id(), "startedAt": "fixture"},
+        "child": null, "childSpawnPending": false, "restoreService": false, "closed": false
+    });
+    let unfinished_record = serde_json::to_string(&unfinished).unwrap();
+    let mut closed = unfinished.clone();
+    closed["closed"] = serde_json::json!(true);
+    let closed_record = serde_json::to_string(&closed).unwrap();
+    let mut unverified = unfinished.clone();
+    unverified["kind"] = serde_json::json!("ocm-source-watch-session-v2");
+    unverified["childSpawnPending"] = serde_json::json!(true);
+    unverified["completion"] = serde_json::json!({
+        "serviceRestored": false, "error": "source shutdown is unverified"
+    });
+    let unverified_record = serde_json::to_string(&unverified).unwrap();
+    let mut lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(override_path.with_extension("lock"))
+        .unwrap();
+    lease.lock_exclusive().unwrap();
+    for (state, record, advice) in [
+        (
+            "starting",
+            Some(unfinished_record.as_str()),
+            "dev stop source",
+        ),
+        (
+            "active",
+            Some(unfinished_record.as_str()),
+            "dev stop source",
+        ),
+        (
+            "restoring",
+            Some(unfinished_record.as_str()),
+            "dev stop source",
+        ),
+        (
+            "unknown",
+            Some(unfinished_record.as_str()),
+            "operator recovery",
+        ),
+        ("active", None, "original dev terminal"),
+        (
+            "active",
+            Some(closed_record.as_str()),
+            "original dev terminal",
+        ),
+        ("active", Some("{"), "operator recovery"),
+        (
+            "active",
+            Some(unverified_record.as_str()),
+            "operator recovery",
+        ),
+    ] {
+        if let Some(record) = record {
+            fs::write(&session_path, record).unwrap();
+        } else {
+            fs::remove_file(&session_path).unwrap();
+        }
+        lease.set_len(0).unwrap();
+        lease.seek(SeekFrom::Start(0)).unwrap();
+        writeln!(
+            lease,
+            "{}snapshot-fixture",
+            if state == "restoring" {
+                "restoring:"
+            } else {
+                ""
+            }
+        )
+        .unwrap();
+        match state {
+            "active" => fs::write(
+                &override_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "kind": "ocm-source-watch-override", "envName": "source", "repoRoot": checkout,
+                    "watchPid": std::process::id(), "token": "lease:snapshot-fixture:fixture",
+                    "startedAt": "2026-06-17T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+            "unknown" => fs::write(&override_path, "{").unwrap(),
+            _ => {
+                let _ = fs::remove_file(&override_path);
+            }
+        }
+        let restored = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "snapshot",
+                "restore",
+                "source",
+                snapshot["id"].as_str().unwrap(),
+            ],
+        );
+        assert!(!restored.status.success(), "accepted {state}");
+        assert!(
+            stderr(&restored).contains(advice),
+            "{state}: {}",
+            stderr(&restored)
+        );
+        if advice != "dev stop source" {
+            assert!(!stderr(&restored).contains("dev stop"));
+        }
+        assert_eq!(fs::read_to_string(&notes).unwrap(), "current state\n");
+        assert_eq!(
+            fs::read(env_registry_path(&env, &cwd).unwrap()).unwrap(),
+            registry_before
+        );
+    }
+    fs::remove_file(&override_path).unwrap();
+    drop(lease);
+    for record in [unfinished_record, "{".to_string()] {
+        fs::write(&session_path, &record).unwrap();
+        let refused = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "snapshot",
+                "restore",
+                "source",
+                snapshot["id"].as_str().unwrap(),
+            ],
+        );
+        assert!(!refused.status.success());
+        let advice = if record == "{" {
+            "operator recovery"
+        } else {
+            "dev stop source"
+        };
+        assert!(stderr(&refused).contains(advice), "{}", stderr(&refused));
+        if record == "{" {
+            assert!(!stderr(&refused).contains("dev stop"));
+        }
+        assert_eq!(fs::read_to_string(&notes).unwrap(), "current state\n");
+        assert_eq!(
+            fs::read(env_registry_path(&env, &cwd).unwrap()).unwrap(),
+            registry_before
+        );
+    }
+    fs::remove_file(&session_path).unwrap();
+    let restored = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "snapshot",
+            "restore",
+            "source",
+            snapshot["id"].as_str().unwrap(),
+        ],
+    );
+    assert!(restored.status.success(), "{}", stderr(&restored));
+    assert_eq!(fs::read_to_string(notes).unwrap(), "snapshot state\n");
+    ocm::env::EnvironmentService::new(&env, &cwd)
+        .restore_snapshot(ocm::env::RestoreEnvSnapshotOptions {
+            env_name: "source".to_string(),
+            snapshot_id: snapshot["id"].as_str().unwrap().to_string(),
+        })
+        .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn accepted_snapshot_restore_reports_cleanup_failure_without_failing() {
+    for json in [false, true] {
+        let root = TestDir::new("snapshot-cleanup-warning");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let notes = root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt");
+        write_text(&notes, "checkpoint bytes\n");
+        let snapshot = run_ocm(
+            &cwd,
+            &env,
+            &["env", "snapshot", "create", "source", "--json"],
+        );
+        assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+        let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+        write_text(&notes, "displaced bytes\n");
+        assert!(
+            Command::new("/usr/bin/chflags")
+                .arg("uchg")
+                .arg(&notes)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut args = vec![
+            "env",
+            "snapshot",
+            "restore",
+            "source",
+            snapshot["id"].as_str().unwrap(),
+        ];
+        args.push(if json { "--json" } else { "--raw" });
+        let restore = run_ocm(&cwd, &env, &args);
+        let retained = fs::read_dir(root.child("ocm-home/envs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+            .expect("cleanup residue must remain available");
+        let displaced = retained
+            .path()
+            .join("displaced/.openclaw/workspace/notes.txt");
+        assert!(
+            Command::new("/usr/bin/chflags")
+                .arg("nouchg")
+                .arg(&displaced)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(restore.status.success(), "{}", stderr(&restore));
+        assert_eq!(fs::read_to_string(notes).unwrap(), "checkpoint bytes\n");
+        assert_eq!(fs::read_to_string(displaced).unwrap(), "displaced bytes\n");
+        assert!(
+            stdout(&restore).contains("cleanup requires attention"),
+            "{}",
+            stdout(&restore)
+        );
+        if json {
+            let result: Value = serde_json::from_str(&stdout(&restore)).unwrap();
+            assert_eq!(result["warnings"].as_array().unwrap().len(), 1);
+        } else {
+            assert!(stdout(&restore).contains("warning: "));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -703,6 +1129,26 @@ fn env_snapshot_restore_remains_compatible_with_legacy_tar_metadata() {
     );
     assert!(restore.status.success(), "{}", stderr(&restore));
     assert_eq!(fs::read_to_string(&notes).unwrap(), "legacy-snapshot\n");
+
+    let mut current = get_environment("source", &env, &cwd).unwrap();
+    current.dev = Some(EnvDevMeta::Owned {
+        repo_root: path_string(&root.child("saved-repo")),
+        worktree_root: path_string(&root.child("saved-worktree")),
+    });
+    let saved_dev = serde_json::to_value(&current.dev).unwrap();
+    save_environment(current, &env, &cwd).unwrap();
+    write_text(&notes, "current dev state\n");
+    let restore = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "restore", "source", snapshot_id],
+    );
+    assert!(restore.status.success(), "{}", stderr(&restore));
+    assert_eq!(fs::read_to_string(&notes).unwrap(), "legacy-snapshot\n");
+    assert_eq!(
+        serde_json::to_value(get_environment("source", &env, &cwd).unwrap().dev).unwrap(),
+        saved_dev
+    );
 }
 
 #[test]
@@ -745,7 +1191,8 @@ fn env_snapshot_create_and_restore_quiesce_a_running_managed_gateway() {
 
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     let registry_path = env_registry_path(&env, &cwd).unwrap();
-    let running_runtime = fs::read(&runtime_path).unwrap();
+    let running_runtime: SupervisorRuntimeState =
+        serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     let observer_done = Arc::new(AtomicBool::new(false));
     let observer_stop = Arc::clone(&observer_done);
@@ -761,7 +1208,7 @@ fn env_snapshot_create_and_restore_quiesce_a_running_managed_gateway() {
                 .unwrap_or(last_running);
             if desired_running != last_running {
                 if desired_running {
-                    fs::write(&runtime_path, &running_runtime).unwrap();
+                    write_json_replacing_path(&runtime_path, &running_runtime);
                 } else {
                     write_empty_snapshot_service(&runtime_path, &ocm_home);
                 }
@@ -853,7 +1300,8 @@ fn env_snapshot_create_waits_for_delayed_supervisor_stop_acknowledgement() {
 
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     let registry_path = env_registry_path(&env, &cwd).unwrap();
-    let running_runtime = fs::read(&runtime_path).unwrap();
+    let running_runtime: SupervisorRuntimeState =
+        serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     let observer_runtime_path = runtime_path.clone();
     let observer_done = Arc::new(AtomicBool::new(false));
@@ -871,7 +1319,7 @@ fn env_snapshot_create_waits_for_delayed_supervisor_stop_acknowledgement() {
                 .unwrap_or(last_running);
             if desired_running != last_running {
                 if desired_running {
-                    fs::write(&observer_runtime_path, &running_runtime).unwrap();
+                    write_json_replacing_path(&observer_runtime_path, &running_runtime);
                 } else {
                     delayed_stop = true;
                     thread::sleep(Duration::from_millis(3_200));
@@ -963,7 +1411,8 @@ fn env_snapshot_create_quiesces_desired_service_before_child_is_observable() {
 
     write_running_snapshot_service(&root, &cwd, &env, 19845);
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
-    let running_runtime = fs::read(&runtime_path).unwrap();
+    let running_runtime: SupervisorRuntimeState =
+        serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     write_empty_snapshot_service(&runtime_path, &ocm_home);
     let registry_path = env_registry_path(&env, &cwd).unwrap();
@@ -986,7 +1435,7 @@ fn env_snapshot_create_quiesces_desired_service_before_child_is_observable() {
                 .unwrap_or(last_running);
             if desired_running != last_running {
                 if desired_running {
-                    fs::write(&observer_runtime_path, &running_runtime).unwrap();
+                    write_json_replacing_path(&observer_runtime_path, &running_runtime);
                     observer_start_count.fetch_add(1, Ordering::Relaxed);
                 } else {
                     write_empty_snapshot_service(&observer_runtime_path, &ocm_home);
@@ -1003,13 +1452,13 @@ fn env_snapshot_create_quiesces_desired_service_before_child_is_observable() {
         &env,
         &["env", "snapshot", "create", "source", "--label", "starting"],
     );
-    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     while start_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
     observer_done.store(true, Ordering::Relaxed);
     observer.join().unwrap();
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
     assert_eq!(stop_count.load(Ordering::Relaxed), 1);
     assert_eq!(start_count.load(Ordering::Relaxed), 1);
 
@@ -1703,6 +2152,70 @@ fn env_snapshot_removes_partial_artifacts_when_sqlite_snapshot_fails() {
     assert_eq!(shown["serviceRunning"], true);
 }
 
+#[cfg(unix)]
+#[test]
+fn env_snapshot_refuses_fifo_before_stopping_the_running_gateway() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let root = TestDir::new("env-snapshot-fifo-preflight");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let health = TestHttpServer::serve_bytes_times("/health", "text/plain", b"ok", 10);
+    let port = url::Url::parse(&health.url()).unwrap().port().unwrap() as u32;
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--port",
+            &port.to_string(),
+            "--launcher",
+            "stable",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let started = run_ocm(&cwd, &env, &["service", "start", "source"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    write_running_snapshot_service(&root, &cwd, &env, port);
+
+    let fifo = root.child("ocm-home/envs/source/unsupported");
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    fs::write(root.child("launchctl.log"), "").unwrap();
+    let snapshot = run_ocm(&cwd, &env, &["env", "snapshot", "create", "source"]);
+    assert_eq!(snapshot.status.code(), Some(1));
+    assert!(
+        stderr(&snapshot).contains("unsupported special file in checkpoint"),
+        "{}",
+        stderr(&snapshot)
+    );
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+    assert!(!root.child("ocm-home/snapshots/source").exists());
+    let lifecycle = fs::read_to_string(root.child("launchctl.log")).unwrap();
+    assert!(!lifecycle.contains("bootout "), "{lifecycle}");
+    let shown = run_ocm(&cwd, &env, &["env", "show", "source", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceEnabled"], true);
+    assert_eq!(shown["serviceRunning"], true);
+}
+
 #[test]
 fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
     let root = TestDir::new("env-snapshot-sqlite-mutated-after-preflight");
@@ -1754,7 +2267,8 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
 
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     let registry_path = env_registry_path(&env, &cwd).unwrap();
-    let running_runtime = fs::read(&runtime_path).unwrap();
+    let running_runtime: SupervisorRuntimeState =
+        serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     let observer_done = Arc::new(AtomicBool::new(false));
     let observer_mutated = Arc::new(AtomicBool::new(false));
@@ -1782,7 +2296,7 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
                             .is_ok_and(|mut entries| entries.next().is_some()),
                         Ordering::Relaxed,
                     );
-                    fs::write(&observer_runtime_path, &running_runtime).unwrap();
+                    write_json_replacing_path(&observer_runtime_path, &running_runtime);
                 } else {
                     fs::write(
                         &observer_database,

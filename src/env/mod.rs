@@ -1,10 +1,13 @@
 mod binding;
+#[cfg(any(unix, windows))]
+pub(crate) mod dev_handoff;
 mod execution;
 mod health;
 mod inspect;
 mod lifecycle;
 mod snapshots;
 mod source_watch;
+mod source_watch_session;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,10 +30,15 @@ pub(crate) use lifecycle::{CloneEnvironmentResult, ImportEnvironmentResult};
 pub use snapshots::{
     CreateEnvSnapshotOptions, EnvSnapshotRemoveSummary, EnvSnapshotRestoreSummary,
     EnvSnapshotSummary, RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
-    select_snapshot_prune_candidates,
+    UpgradeCheckpointScope, select_snapshot_prune_candidates,
 };
-pub use source_watch::SourceWatchOverride;
-pub(crate) use source_watch::{CreateSourceWatchOverrideOptions, SourceWatchLease};
+pub(crate) use source_watch::{
+    CreateSourceWatchOverrideOptions, SourceWatchLease, SourceWatchMode, SourceWatchState,
+};
+pub use source_watch::{SourceWatchEndpoint, SourceWatchOverride, SourceWatchUiEndpoint};
+pub(crate) use source_watch_session::{
+    DevUiChildRole, SourceUiTarget, SourceWatchCompletion, SourceWatchSession,
+};
 
 pub struct EnvironmentService<'a> {
     env: &'a BTreeMap<String, String>,

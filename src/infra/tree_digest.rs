@@ -14,18 +14,43 @@ pub(crate) struct TreeInventoryEntry {
     sha256: Option<[u8; 32]>,
 }
 
+impl TreeInventoryEntry {
+    pub(crate) fn is_socket(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.mode & u32::from(libc::S_IFMT) == u32::from(libc::S_IFSOCK)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
 /// Returns a deterministic inventory of a tree without following symlinks.
 pub(crate) fn inventory_tree(root: &Path) -> Result<BTreeMap<PathBuf, TreeInventoryEntry>, String> {
+    inventory_tree_except(root, &[])
+}
+
+/// Checkpoint-owned selection; runtime inventories always use the complete tree.
+pub(crate) fn inventory_tree_except(
+    root: &Path,
+    independent: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, TreeInventoryEntry>, String> {
     let mut out = BTreeMap::new();
-    inventory_path(root, root, &mut out)?;
+    inventory_path(root, root, independent, &mut out)?;
     Ok(out)
 }
 
 fn inventory_path(
     root: &Path,
     path: &Path,
+    independent: &[PathBuf],
     out: &mut BTreeMap<PathBuf, TreeInventoryEntry>,
 ) -> Result<(), String> {
+    if independent.iter().any(|entry| path == root.join(entry)) {
+        return Ok(());
+    }
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
     let relative = path.strip_prefix(root).unwrap_or(path).to_path_buf();
@@ -60,7 +85,7 @@ fn inventory_path(
             .map_err(|error| error.to_string())?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
-            inventory_path(root, &entry.path(), out)?;
+            inventory_path(root, &entry.path(), independent, out)?;
         }
     }
     Ok(())
@@ -151,6 +176,26 @@ fn metadata_mode(metadata: &fs::Metadata) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::tree_sha256;
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_digest_still_refuses_unix_sockets() {
+        let root = tempfile::Builder::new()
+            .prefix("ocmr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(root.path().join("endpoint")).unwrap();
+        assert!(
+            super::inventory_tree(root.path()).unwrap()[std::path::Path::new("endpoint")]
+                .is_socket()
+        );
+        assert!(
+            tree_sha256(root.path())
+                .unwrap_err()
+                .contains("unsupported entry type")
+        );
+    }
 
     #[cfg(unix)]
     #[test]

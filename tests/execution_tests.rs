@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 
 fn sample_env(default_runtime: Option<&str>, default_launcher: Option<&str>) -> EnvMeta {
     EnvMeta {
+        upgrade_independent_paths: Vec::new(),
         kind: "ocm-env".to_string(),
         name: "demo".to_string(),
         root: "/tmp/demo".to_string(),
@@ -22,6 +23,7 @@ fn sample_env(default_runtime: Option<&str>, default_launcher: Option<&str>) -> 
         default_runtime: default_runtime.map(str::to_string),
         default_launcher: default_launcher.map(str::to_string),
         dev: None,
+        dev_ui_port: None,
         protected: false,
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -119,7 +121,7 @@ fn resolve_execution_binding_falls_back_to_launcher_default() {
 #[test]
 fn resolve_execution_binding_falls_back_to_dev_binding() {
     let mut env = sample_env(None, None);
-    env.dev = Some(EnvDevMeta {
+    env.dev = Some(EnvDevMeta::Owned {
         repo_root: "/tmp/openclaw".to_string(),
         worktree_root: "/tmp/openclaw/.worktrees/demo".to_string(),
     });

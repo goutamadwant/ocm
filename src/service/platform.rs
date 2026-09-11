@@ -278,10 +278,24 @@ pub(crate) fn validate_managed_service_owner(
     let Some(ocm_home) = definition.environment.get("OCM_HOME") else {
         return Ok(());
     };
-    let raw = fs::read_to_string(&definition.definition_path).map_err(|error| {
+    if managed_service_owner_matches(&definition.definition_path, ocm_home, env)? {
+        return Ok(());
+    }
+    Err(format!(
+        "the managed OCM service at {} is already bound to a different OCM_HOME; stop and uninstall that service before activating this store",
+        display_path(&definition.definition_path)
+    ))
+}
+
+pub(crate) fn managed_service_owner_matches(
+    definition_path: &Path,
+    ocm_home: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<bool, String> {
+    let raw = fs::read_to_string(definition_path).map_err(|error| {
         format!(
             "failed to read existing service definition {}: {error}",
-            display_path(&definition.definition_path)
+            display_path(definition_path)
         )
     })?;
     let owner_markers = match service_manager_kind(env) {
@@ -296,15 +310,34 @@ pub(crate) fn validate_managed_service_owner(
                 systemd_legacy_escape(ocm_home)
             ),
         ],
-        ServiceManagerKind::Unsupported => return Ok(()),
+        ServiceManagerKind::Unsupported => return Ok(true),
     };
-    if owner_markers.iter().any(|marker| raw.contains(marker)) {
+    Ok(owner_markers.iter().any(|marker| raw.contains(marker)))
+}
+
+pub(crate) fn validate_managed_service_executable(
+    definition: &ManagedServiceDefinition,
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if !definition.definition_path.exists() {
         return Ok(());
     }
-    Err(format!(
-        "the managed OCM service at {} is already bound to a different OCM_HOME; stop and uninstall that service before activating this store",
-        display_path(&definition.definition_path)
-    ))
+    let raw = fs::read_to_string(&definition.definition_path).map_err(|e| e.to_string())?;
+    let marker = match service_manager_kind(env) {
+        ServiceManagerKind::Launchd => format!(
+            "<key>ProgramArguments</key>\n    <array>\n      <string>{}</string>",
+            plist_escape(&definition.program_arguments[0])
+        ),
+        ServiceManagerKind::SystemdUser => format!(
+            "\nExecStart={} __daemon run\n",
+            systemd_quote(&definition.program_arguments[0])
+        ),
+        ServiceManagerKind::Unsupported => return Err(unsupported_service_manager_message().into()),
+    };
+    if !raw.contains(&marker) {
+        return Err("managed daemon uses a different executable or a nonstandard service definition; refusing self-update".into());
+    }
+    Ok(())
 }
 
 pub(crate) fn deactivate_managed_service(
@@ -958,7 +991,7 @@ fn set_systemd_service_enablement(
     Ok(())
 }
 
-fn gui_domain(env: &BTreeMap<String, String>) -> Result<String, String> {
+pub(crate) fn gui_domain(env: &BTreeMap<String, String>) -> Result<String, String> {
     let id_bin = env
         .get(ID_BIN_OVERRIDE)
         .map(String::as_str)

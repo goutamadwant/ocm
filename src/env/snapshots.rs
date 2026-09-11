@@ -1,17 +1,24 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
-use super::EnvironmentService;
+use super::{EnvMeta, EnvironmentService};
 use crate::store::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
-    create_env_snapshot, create_env_snapshot_from_preparation, get_env_snapshot,
-    list_all_env_snapshots, list_env_snapshots, now_utc, prepare_env_snapshot_capture,
-    prepare_env_snapshot_restore, remove_env_snapshot, restore_env_snapshot,
+    create_env_snapshot, create_env_snapshot_from_preparation,
+    ensure_restore_preserves_dev_sources, get_env_snapshot, list_all_env_snapshots,
+    list_env_snapshots, now_utc, prepare_env_snapshot_capture, prepare_env_snapshot_restore,
+    prepare_upgrade_checkpoint_capture, prepare_upgrade_snapshot_restore, remove_env_snapshot,
     rollback_env_snapshot_restore, summarize_snapshot,
 };
 use crate::supervisor::sync_supervisor_env_if_present;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpgradeCheckpointScope {
+    pub independent_paths: Vec<std::path::PathBuf>,
+}
 
 #[derive(Clone, Debug)]
 pub struct CreateEnvSnapshotOptions {
@@ -27,6 +34,8 @@ pub struct EnvSnapshotSummary {
     pub label: Option<String>,
     pub archive_path: String,
     pub storage_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade_scope: Option<UpgradeCheckpointScope>,
     pub source_root: String,
     pub gateway_port: Option<u32>,
     pub service_enabled: bool,
@@ -50,6 +59,8 @@ pub struct EnvSnapshotRestoreSummary {
     pub default_runtime: Option<String>,
     pub default_launcher: Option<String>,
     pub protected: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -146,6 +157,13 @@ impl<'a> EnvironmentService<'a> {
         prepare_env_snapshot_capture(env_name, self.env, self.cwd)
     }
 
+    pub(crate) fn prepare_upgrade_checkpoint_locked(
+        &self,
+        env_name: &str,
+    ) -> Result<PreparedEnvSnapshotCapture, String> {
+        prepare_upgrade_checkpoint_capture(env_name, self.env, self.cwd)
+    }
+
     pub(crate) fn create_snapshot_locked_from_preparation(
         &self,
         options: CreateEnvSnapshotOptions,
@@ -182,6 +200,34 @@ impl<'a> EnvironmentService<'a> {
         Ok(summarize_snapshot(&snapshot))
     }
 
+    pub(crate) fn ensure_snapshot_restore_preserves_dev_sources_locked(
+        &self,
+        snapshot: &EnvSnapshotSummary,
+    ) -> Result<(), String> {
+        ensure_restore_preserves_dev_sources(
+            &self.get(&snapshot.env_name)?,
+            snapshot
+                .upgrade_scope
+                .as_ref()
+                .map(|scope| scope.independent_paths.as_slice())
+                .unwrap_or_default(),
+            self.env,
+            self.cwd,
+        )
+    }
+
+    pub(crate) fn ensure_upgrade_rollback_preserves_dev_sources_locked(
+        &self,
+        meta: &EnvMeta,
+    ) -> Result<(), String> {
+        ensure_restore_preserves_dev_sources(
+            meta,
+            &meta.upgrade_independent_paths,
+            self.env,
+            self.cwd,
+        )
+    }
+
     pub fn restore_snapshot(
         &self,
         options: RestoreEnvSnapshotOptions,
@@ -195,7 +241,8 @@ impl<'a> EnvironmentService<'a> {
         options: RestoreEnvSnapshotOptions,
     ) -> Result<EnvSnapshotRestoreSummary, String> {
         let env_name = options.env_name.clone();
-        let summary = restore_env_snapshot(options, self.env, self.cwd)?;
+        let transaction = prepare_env_snapshot_restore(options, self.env, self.cwd)?;
+        let summary = commit_env_snapshot_restore(transaction);
         sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
         Ok(summary)
     }
@@ -210,10 +257,20 @@ impl<'a> EnvironmentService<'a> {
         Ok(transaction)
     }
 
+    pub(crate) fn prepare_upgrade_snapshot_restore_locked(
+        &self,
+        options: RestoreEnvSnapshotOptions,
+    ) -> Result<EnvSnapshotRestoreTransaction, String> {
+        let env_name = options.env_name.clone();
+        let transaction = prepare_upgrade_snapshot_restore(options, self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &env_name)?;
+        Ok(transaction)
+    }
+
     pub(crate) fn commit_snapshot_restore_locked(
         &self,
         transaction: EnvSnapshotRestoreTransaction,
-    ) -> Result<(), String> {
+    ) -> EnvSnapshotRestoreSummary {
         commit_env_snapshot_restore(transaction)
     }
 
@@ -332,6 +389,7 @@ mod tests {
 
     fn snapshot(id: &str, env_name: &str, created_at: OffsetDateTime) -> EnvSnapshotSummary {
         EnvSnapshotSummary {
+            upgrade_scope: None,
             id: id.to_string(),
             env_name: env_name.to_string(),
             label: None,

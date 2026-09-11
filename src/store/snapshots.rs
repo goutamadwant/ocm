@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::env::{
     CreateEnvSnapshotOptions, EnvMeta, EnvSnapshotRemoveSummary, EnvSnapshotRestoreSummary,
     EnvSnapshotSummary, RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
-    default_service_enabled, default_service_running,
+    UpgradeCheckpointScope, default_service_enabled, default_service_running,
 };
 use crate::infra::archive::{EnvArchiveMetadata, extract_env_archive};
 use serde::{Deserialize, Serialize};
@@ -16,10 +16,12 @@ use time::OffsetDateTime;
 use super::checkpoints::{
     CheckpointCleanup, PreparedTreeCheckpoint, STORAGE_TAR_ARCHIVE, copy_tree_checkpoint,
     create_tree_checkpoint_from_preparation, default_snapshot_storage_kind,
-    prepare_tree_checkpoint_in, remove_tree_if_present,
+    prepare_scoped_tree_checkpoint_in, remove_tree_if_present,
 };
-use super::common::{
-    copy_dir_recursive, copy_path_recursive, load_json_files, path_exists, read_json, write_json,
+use super::common::{copy_path_recursive, load_json_files, path_exists, read_json, write_json};
+use super::dev_sources::{
+    contains_existing, path_identity, projected_path_contains, projected_path_relative,
+    registered_dev_source_footprint,
 };
 use super::layout::{
     derive_env_paths, display_path, snapshot_archive_path, snapshot_checkpoint_path,
@@ -30,6 +32,8 @@ use super::{
     get_environment, list_environments, now_utc, remove_upgrade_recovery_for_snapshot,
     rewrite_openclaw_config_for_target, save_environment,
 };
+
+const UPGRADE_CHECKPOINT_KIND: &str = "ocm-env-upgrade-checkpoint-v1";
 
 static NEXT_REMOVAL_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -44,6 +48,8 @@ pub struct EnvSnapshotMeta {
     pub archive_path: String,
     #[serde(default = "default_snapshot_storage_kind")]
     pub storage_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_scope: Option<UpgradeCheckpointScope>,
     pub source_root: String,
     pub gateway_port: Option<u32>,
     #[serde(default)]
@@ -67,6 +73,16 @@ pub(crate) struct EnvSnapshotRestoreTransaction {
     displaced_root: Option<PathBuf>,
     rejected_root: PathBuf,
     restored_root: PathBuf,
+    independent: Vec<PathBuf>,
+}
+
+impl EnvSnapshotRestoreTransaction {
+    pub(crate) fn retained_operation_note(&self) -> String {
+        format!(
+            "restore operation retained at {}",
+            display_path(&self.operation_root)
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -74,6 +90,7 @@ pub(crate) struct PreparedEnvSnapshotCapture {
     env_name: String,
     source_root: PathBuf,
     checkpoint: PreparedTreeCheckpoint,
+    upgrade_scope: Option<UpgradeCheckpointScope>,
 }
 
 impl PreparedEnvSnapshotCapture {
@@ -89,6 +106,126 @@ struct RestoreOperationNamespace {
     backup_root: PathBuf,
     legacy_staging_root: PathBuf,
     rejected_root: PathBuf,
+}
+
+/// Resolve existing aliases while retaining absent descendants. An unresolved
+/// symlink is ambiguous ownership, not evidence that a workspace is unrelated.
+fn resolve_scope_path(path: &Path) -> Result<PathBuf, String> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(existing) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(existing) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => {
+                        return Err(format!(
+                            "cannot resolve workspace ownership: {}",
+                            display_path(path)
+                        ));
+                    }
+                }
+                missing.push(
+                    existing
+                        .file_name()
+                        .ok_or("missing workspace path name")?
+                        .to_os_string(),
+                );
+                existing = existing.parent().ok_or("missing workspace path parent")?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+pub(crate) fn validate_upgrade_independent_paths(
+    meta: &EnvMeta,
+    independent: &[PathBuf],
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if independent.is_empty() {
+        return Ok(());
+    }
+    let paths = derive_env_paths(Path::new(&meta.root));
+    super::checkpoint_scope::validate_ancestors(&paths.root, independent)?;
+    let workspaces = super::resolve_env_openclaw_workspaces(
+        &paths,
+        env,
+        OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port),
+    )?;
+    let workspace_targets = workspaces
+        .workspace_roots()
+        .map(|workspace| resolve_scope_path(workspace))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut configuration =
+        super::openclaw_config_include_paths(&paths.config_path, &paths.state_dir)?;
+    configuration.push(paths.config_path.clone());
+    for config in configuration.clone() {
+        match fs::canonicalize(&config) {
+            Ok(target) => configuration.push(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    for relative in independent {
+        let absolute = paths.root.join(relative);
+        // A directory boundary keeps a database together with adjacent WAL and
+        // journal files. Never infer ownership from extensions or inspect the
+        // declared directory's contents.
+        match fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("independent paths must name directories (which may not yet exist); declare a parent directory for files or symlinks".to_string()),
+        }
+        let resolved =
+            fs::canonicalize(absolute.parent().ok_or("missing independent path parent")?)
+                .map_err(|error| error.to_string())?
+                .join(
+                    absolute
+                        .file_name()
+                        .ok_or("missing independent path name")?,
+                );
+        if configuration
+            .iter()
+            .any(|config| config.starts_with(&absolute) || config.starts_with(&resolved))
+        {
+            return Err(format!(
+                "independent path includes rollback-owned configuration: {}",
+                display_path(relative)
+            ));
+        }
+        if workspaces
+            .workspace_roots()
+            .any(|workspace| workspace.starts_with(&absolute))
+            || workspace_targets
+                .iter()
+                .any(|workspace| workspace.starts_with(&resolved))
+        {
+            return Err(format!(
+                "a configured workspace can contain migration-owned state; declare only independent content beneath it: {}",
+                display_path(relative)
+            ));
+        }
+        if !workspaces
+            .workspace_roots()
+            .any(|workspace| absolute.starts_with(workspace))
+            && !workspace_targets
+                .iter()
+                .any(|workspace| resolved.starts_with(workspace))
+        {
+            return Err(format!(
+                "independent paths must be beneath a configured workspace: {}",
+                display_path(relative)
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn create_env_snapshot(
@@ -114,6 +251,23 @@ pub(crate) fn prepare_env_snapshot_capture(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<PreparedEnvSnapshotCapture, String> {
+    prepare_snapshot_capture(env_name, false, env, cwd)
+}
+
+pub(crate) fn prepare_upgrade_checkpoint_capture(
+    env_name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<PreparedEnvSnapshotCapture, String> {
+    prepare_snapshot_capture(env_name, true, env, cwd)
+}
+
+fn prepare_snapshot_capture(
+    env_name: &str,
+    upgrade: bool,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<PreparedEnvSnapshotCapture, String> {
     let env_name = validate_name(env_name, "Environment name")?;
     let meta = get_environment(&env_name, env, cwd)?;
     let env_paths = derive_env_paths(Path::new(&meta.root));
@@ -123,12 +277,28 @@ pub(crate) fn prepare_env_snapshot_capture(
             display_path(&env_paths.root)
         ));
     }
-    let checkpoint =
-        prepare_tree_checkpoint_in(&env_paths.root, &snapshot_env_dir(&env_name, env, cwd)?)?;
+    let upgrade_scope = if upgrade {
+        validate_upgrade_independent_paths(&meta, &meta.upgrade_independent_paths, env)?;
+        Some(UpgradeCheckpointScope {
+            independent_paths: meta.upgrade_independent_paths.clone(),
+        })
+    } else {
+        None
+    };
+    let independent = upgrade_scope
+        .as_ref()
+        .map(|scope| scope.independent_paths.as_slice())
+        .unwrap_or_default();
+    let checkpoint = prepare_scoped_tree_checkpoint_in(
+        &env_paths.root,
+        &snapshot_env_dir(&env_name, env, cwd)?,
+        independent,
+    )?;
     Ok(PreparedEnvSnapshotCapture {
         env_name,
         source_root: env_paths.root,
         checkpoint,
+        upgrade_scope,
     })
 }
 
@@ -164,6 +334,15 @@ pub(crate) fn create_env_snapshot_from_preparation(
         ));
     }
 
+    if let Some(scope) = &prepared.upgrade_scope {
+        if scope.independent_paths != meta.upgrade_independent_paths {
+            return Err(
+                "independent upgrade paths changed after checkpoint preparation".to_string(),
+            );
+        }
+        validate_upgrade_independent_paths(&meta, &scope.independent_paths, env)?;
+    }
+
     let created_at = now_utc();
     let snapshot_id = format!(
         "{}-{:09}",
@@ -177,8 +356,20 @@ pub(crate) fn create_env_snapshot_from_preparation(
     let result = (|| {
         let storage_kind =
             create_tree_checkpoint_from_preparation(prepared.checkpoint, &checkpoint_path)?;
+        if let Some(scope) = &prepared.upgrade_scope {
+            super::checkpoint_scope::validate_scoped_artifact(
+                &checkpoint_path,
+                &scope.independent_paths,
+            )?;
+        }
         let snapshot = EnvSnapshotMeta {
-            kind: "ocm-env-snapshot".to_string(),
+            kind: if prepared.upgrade_scope.is_some() {
+                UPGRADE_CHECKPOINT_KIND
+            } else {
+                "ocm-env-snapshot"
+            }
+            .to_string(),
+            upgrade_scope: prepared.upgrade_scope,
             id: snapshot_id,
             env_name: meta.name.clone(),
             label: options.label,
@@ -238,6 +429,7 @@ pub fn summarize_snapshot(meta: &EnvSnapshotMeta) -> EnvSnapshotSummary {
         label: meta.label.clone(),
         archive_path: meta.archive_path.clone(),
         storage_kind: meta.storage_kind.clone(),
+        upgrade_scope: meta.upgrade_scope.clone(),
         source_root: meta.source_root.clone(),
         gateway_port: meta.gateway_port,
         service_enabled: meta.service_enabled,
@@ -249,15 +441,116 @@ pub fn summarize_snapshot(meta: &EnvSnapshotMeta) -> EnvSnapshotSummary {
     }
 }
 
+pub(crate) fn ensure_restore_preserves_dev_sources(
+    target: &EnvMeta,
+    independent: &[PathBuf],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(), String> {
+    super::with_locked_environments(env, cwd, |envs| {
+        let protected = |meta: &EnvMeta| {
+            meta.dev
+                .as_ref()
+                .is_some_and(|dev| meta.name != target.name || dev.borrowed_source_root().is_some())
+        };
+        if !envs.iter().any(protected) {
+            return Ok(());
+        }
+        let target_root = Path::new(&target.root);
+        if !independent.is_empty() {
+            super::checkpoint_scope::validate_ancestors(target_root, independent)?;
+        }
+        // A full restore renames the root entry itself, including a final
+        // symlink. Resolve its parent without following that final entry.
+        let parent = fs::canonicalize(target_root.parent().unwrap_or(target_root))
+            .map_err(|error| error.to_string())?;
+        let root = parent.join(target_root.file_name().unwrap_or_default());
+        let root_identity = match fs::symlink_metadata(&root) {
+            Ok(_) => Some(path_identity(&root)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let relative_to_root = |path: &Path| -> Result<Option<PathBuf>, String> {
+            if let Ok(relative) = path.strip_prefix(&root) {
+                return Ok(Some(relative.to_path_buf()));
+            }
+            // Compare known path ancestors for filesystem aliases, including
+            // macOS firmlinks. Never resolve or inspect an exclusion's contents.
+            if let Some(identity) = root_identity {
+                for ancestor in path.ancestors() {
+                    if path_identity(ancestor)? == identity {
+                        return Ok(Some(path.strip_prefix(ancestor).unwrap().to_path_buf()));
+                    }
+                }
+            }
+            Ok(None)
+        };
+        for meta in envs.iter().filter(|meta| protected(meta)) {
+            let Some(footprint) = registered_dev_source_footprint(meta, envs).map_err(|error| {
+                format!("cannot protect dev source for env {}: {error}", meta.name)
+            })?
+            else {
+                continue;
+            };
+            let replacement_error = |path: &Path| {
+                format!(
+                    "restoring env {} would replace registered dev source or Git metadata for env {} at {}; choose a checkpoint that preserves the complete source and Git metadata",
+                    target.name,
+                    meta.name,
+                    display_path(path)
+                )
+            };
+            for (path, contents) in footprint
+                .entries
+                .iter()
+                .map(|path| (path, false))
+                .chain(footprint.content_roots.iter().map(|path| (path, true)))
+            {
+                let affected = if let Some(relative) = relative_to_root(path)? {
+                    !independent.iter().any(|excluded| {
+                        relative.starts_with(excluded)
+                            || (!contents && excluded.starts_with(&relative))
+                    })
+                } else {
+                    contents
+                        && contains_existing(
+                            path,
+                            if root_identity.is_some() {
+                                &root
+                            } else {
+                                &parent
+                            },
+                        )?
+                };
+                if affected {
+                    return Err(replacement_error(path));
+                }
+            }
+            for path in &footprint.reserved_roots {
+                let affected = if let Some(relative) = projected_path_relative(&root, path)? {
+                    !independent
+                        .iter()
+                        .any(|excluded| relative.starts_with(excluded))
+                } else {
+                    projected_path_contains(path, &root)?
+                };
+                if affected {
+                    return Err(replacement_error(path));
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 pub fn restore_env_snapshot(
     options: RestoreEnvSnapshotOptions,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreSummary, String> {
+    let _operation_lock = super::lock_environment_operation(&options.env_name, env, cwd)?;
     let transaction = prepare_env_snapshot_restore(options, env, cwd)?;
-    let summary = transaction.summary.clone();
-    commit_env_snapshot_restore(transaction)?;
-    Ok(summary)
+    Ok(commit_env_snapshot_restore(transaction))
 }
 
 pub(crate) fn prepare_env_snapshot_restore(
@@ -265,11 +558,43 @@ pub(crate) fn prepare_env_snapshot_restore(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreTransaction, String> {
+    prepare_env_snapshot_restore_with_binding(options, true, env, cwd)
+}
+
+pub(crate) fn prepare_upgrade_snapshot_restore(
+    options: RestoreEnvSnapshotOptions,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvSnapshotRestoreTransaction, String> {
+    prepare_env_snapshot_restore_with_binding(options, false, env, cwd)
+}
+
+fn prepare_env_snapshot_restore_with_binding(
+    options: RestoreEnvSnapshotOptions,
+    preserve_current_dev_execution: bool,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvSnapshotRestoreTransaction, String> {
     let env_name = validate_name(&options.env_name, "Environment name")?;
     let snapshot = get_env_snapshot(&env_name, &options.snapshot_id, env, cwd)?;
+    crate::env::EnvironmentService::new(env, cwd)
+        .ensure_source_watch_allows_state_mutation_locked(&env_name)?;
     let current = get_environment(&env_name, env, cwd)?;
     let current_paths = derive_env_paths(Path::new(&current.root));
     let root_exists = path_exists(&current_paths.root);
+    let independent = snapshot
+        .upgrade_scope
+        .as_ref()
+        .map(|scope| scope.independent_paths.clone())
+        .unwrap_or_default();
+    ensure_restore_preserves_dev_sources(&current, &independent, env, cwd)?;
+    if !independent.is_empty() {
+        super::checkpoint_scope::validate_ancestors(&current_paths.root, &independent)?;
+        super::checkpoint_scope::validate_scoped_artifact(
+            Path::new(&snapshot.archive_path),
+            &independent,
+        )?;
+    }
 
     let operation = create_restore_operation_namespace(&current_paths.root)?;
     let staging_dir = operation.legacy_staging_root.clone();
@@ -294,10 +619,11 @@ pub(crate) fn prepare_env_snapshot_restore(
                     extracted.metadata.format_version
                 ));
             }
-            copy_dir_recursive(&extracted.root_dir, &candidate_root)?;
+            copy_path_recursive(&extracted.root_dir, &candidate_root)?;
             let archived = extracted.metadata.env;
             (
                 EnvMeta {
+                    upgrade_independent_paths: current.upgrade_independent_paths.clone(),
                     kind: "ocm-env".to_string(),
                     name: current.name.clone(),
                     root: current.root.clone(),
@@ -307,7 +633,8 @@ pub(crate) fn prepare_env_snapshot_restore(
                     service_running: archived.service_running,
                     default_runtime: archived.default_runtime,
                     default_launcher: archived.default_launcher,
-                    dev: None,
+                    dev: current.dev.clone(),
+                    dev_ui_port: current.dev_ui_port,
                     protected: archived.protected,
                     created_at: current.created_at,
                     updated_at: current.updated_at,
@@ -320,6 +647,7 @@ pub(crate) fn prepare_env_snapshot_restore(
             clear_snapshot_runtime_residue(&candidate_root)?;
             (
                 EnvMeta {
+                    upgrade_independent_paths: current.upgrade_independent_paths.clone(),
                     kind: "ocm-env".to_string(),
                     name: current.name.clone(),
                     root: current.root.clone(),
@@ -329,7 +657,8 @@ pub(crate) fn prepare_env_snapshot_restore(
                     service_running: snapshot.service_running,
                     default_runtime: snapshot.default_runtime.clone(),
                     default_launcher: snapshot.default_launcher.clone(),
-                    dev: None,
+                    dev: current.dev.clone(),
+                    dev_ui_port: current.dev_ui_port,
                     protected: snapshot.protected,
                     created_at: current.created_at,
                     updated_at: current.updated_at,
@@ -339,15 +668,31 @@ pub(crate) fn prepare_env_snapshot_restore(
             )
         };
 
+        if preserve_current_dev_execution && current.dev.is_some() {
+            restored.default_runtime = current.default_runtime.clone();
+            restored.default_launcher = current.default_launcher.clone();
+        }
+
         let mut renamed = false;
-        if root_exists {
+        if !independent.is_empty() {
+            super::checkpoint_scope::replace_owned_entries(
+                &current_paths.root,
+                &candidate_root,
+                &backup_root,
+                &independent,
+            )?;
+            renamed = true;
+        } else if root_exists {
             fs::rename(&current_paths.root, &backup_root).map_err(|error| error.to_string())?;
             renamed = true;
         }
 
         let restore_result = (|| {
-            fs::rename(&candidate_root, &current_paths.root).map_err(|error| error.to_string())?;
-            if legacy_archive {
+            if independent.is_empty() {
+                fs::rename(&candidate_root, &current_paths.root)
+                    .map_err(|error| error.to_string())?;
+            }
+            if legacy_archive && !restore_uses_directory_link(&current_paths.root)? {
                 rewrite_openclaw_config_for_target(
                     &current_paths,
                     Some(Path::new(&snapshot.source_root)),
@@ -382,12 +727,14 @@ pub(crate) fn prepare_env_snapshot_restore(
                     default_runtime: meta.default_runtime.clone(),
                     default_launcher: meta.default_launcher.clone(),
                     protected: meta.protected,
+                    warnings: Vec::new(),
                 },
                 original: current.clone(),
                 operation_root: operation.root.clone(),
                 displaced_root: renamed.then_some(backup_root.clone()),
                 rejected_root: operation.rejected_root.clone(),
                 restored_root: current_paths.root.clone(),
+                independent: independent.clone(),
             }),
             Err(error) => {
                 match reinstate_displaced_environment_root(
@@ -395,6 +742,7 @@ pub(crate) fn prepare_env_snapshot_restore(
                     renamed.then_some(backup_root.as_path()),
                     &operation.rejected_root,
                     current.clone(),
+                    &independent,
                     env,
                     cwd,
                 ) {
@@ -420,14 +768,17 @@ pub(crate) fn prepare_env_snapshot_restore(
 }
 
 pub(crate) fn commit_env_snapshot_restore(
-    transaction: EnvSnapshotRestoreTransaction,
-) -> Result<(), String> {
-    remove_tree_if_present(&transaction.operation_root).map_err(|error| {
-        format!(
-            "restored snapshot was accepted, but its operation namespace {} could not be removed: {error}",
+    mut transaction: EnvSnapshotRestoreTransaction,
+) -> EnvSnapshotRestoreSummary {
+    // Acceptance is complete. Discarding displaced bytes cannot undo it or
+    // prevent the caller from recovering the restored service.
+    if let Err(error) = remove_tree_if_present(&transaction.operation_root) {
+        transaction.summary.warnings.push(format!(
+            "restored snapshot was accepted; cleanup requires attention at {}: {error}",
             display_path(&transaction.operation_root)
-        )
-    })
+        ));
+    }
+    transaction.summary
 }
 
 pub(crate) fn rollback_env_snapshot_restore(
@@ -440,6 +791,7 @@ pub(crate) fn rollback_env_snapshot_restore(
         transaction.displaced_root.as_deref(),
         &transaction.rejected_root,
         transaction.original,
+        &transaction.independent,
         env,
         cwd,
     )?;
@@ -460,9 +812,33 @@ fn reinstate_displaced_environment_root(
     displaced_root: Option<&Path>,
     rejected_root: &Path,
     original: EnvMeta,
+    independent: &[PathBuf],
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<(), String> {
+    if !independent.is_empty() {
+        let displaced =
+            displaced_root.ok_or("scoped restore is missing displaced owned entries")?;
+        super::checkpoint_scope::replace_owned_entries(
+            restored_root,
+            displaced,
+            rejected_root,
+            independent,
+        )?;
+        if let Err(error) = save_environment(original, env, cwd) {
+            super::checkpoint_scope::replace_owned_entries(
+                restored_root,
+                rejected_root,
+                displaced,
+                independent,
+            )
+            .map_err(|compensation| {
+                format!("{error}; scoped restore compensation failed: {compensation}")
+            })?;
+            return Err(error);
+        }
+        return Ok(());
+    }
     fs::rename(restored_root, rejected_root).map_err(|error| {
         format!(
             "failed to retain rejected restored root {} at {}: {error}",
@@ -583,9 +959,22 @@ fn should_discard_current_openclaw_restore_entry(name: &OsStr, is_dir: bool) -> 
     )
 }
 
+fn restore_uses_directory_link(root: &Path) -> Result<bool, String> {
+    // Captured links do not grant ownership of their live destinations.
+    for path in [root.to_path_buf(), root.join(".openclaw")] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(false)
+}
+
 fn clear_snapshot_runtime_residue(root: &Path) -> Result<(), String> {
     let openclaw_root = root.join(".openclaw");
-    if !path_exists(&openclaw_root) {
+    if restore_uses_directory_link(root)? || !path_exists(&openclaw_root) {
         return Ok(());
     }
     let entries = match fs::read_dir(&openclaw_root) {
@@ -763,8 +1152,17 @@ fn validate_env_snapshot_identity(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<(), String> {
-    if snapshot.kind != "ocm-env-snapshot" {
-        return Err(format!("unsupported snapshot kind: {}", snapshot.kind));
+    match (snapshot.kind.as_str(), &snapshot.upgrade_scope) {
+        ("ocm-env-snapshot", None) => {}
+        (UPGRADE_CHECKPOINT_KIND, Some(scope)) if snapshot.storage_kind != STORAGE_TAR_ARCHIVE => {
+            super::checkpoint_scope::validate_independent_paths(&scope.independent_paths)?;
+        }
+        _ => {
+            return Err(format!(
+                "unsupported snapshot kind or scope: {}",
+                snapshot.kind
+            ));
+        }
     }
     if snapshot.env_name != env_name {
         return Err(format!(

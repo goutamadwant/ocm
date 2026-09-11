@@ -6,6 +6,18 @@ use crate::store::{
 use crate::supervisor::sync_supervisor_env_if_present;
 
 impl<'a> EnvironmentService<'a> {
+    pub fn set_upgrade_independent_paths(
+        &self,
+        name: &str,
+        paths: Vec<std::path::PathBuf>,
+    ) -> Result<EnvMeta, String> {
+        let _lock = self.lock_operation(name)?;
+        let mut meta = get_environment(name, self.env, self.cwd)?;
+        crate::store::validate_upgrade_independent_paths(&meta, &paths, self.env)?;
+        meta.upgrade_independent_paths = paths;
+        save_environment(meta, self.env, self.cwd)
+    }
+
     pub fn set_launcher(&self, name: &str, launcher_name: &str) -> Result<EnvMeta, String> {
         let _lock = self.lock_operation(name)?;
         let mut meta = get_environment(name, self.env, self.cwd)?;

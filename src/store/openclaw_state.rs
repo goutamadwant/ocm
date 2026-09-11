@@ -908,6 +908,7 @@ mod tests {
 
     fn meta(name: &str, root: &str) -> EnvMeta {
         EnvMeta {
+            upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name: name.to_string(),
             root: root.to_string(),
@@ -918,6 +919,7 @@ mod tests {
             default_runtime: None,
             default_launcher: None,
             dev: None,
+            dev_ui_port: None,
             protected: false,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,

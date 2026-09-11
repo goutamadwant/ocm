@@ -18,7 +18,7 @@ use std::io::Write;
 
 use super::common::{ensure_dir, path_exists};
 use super::layout::display_path;
-use crate::infra::tree_digest::inventory_tree;
+use crate::infra::tree_digest::{inventory_tree, inventory_tree_except};
 
 pub(crate) const STORAGE_APFS_CLONE: &str = "apfs-clone-v1";
 pub(crate) const STORAGE_FULL_COPY: &str = "full-copy-v1";
@@ -27,6 +27,7 @@ pub(crate) const STORAGE_TAR_ARCHIVE: &str = "tar-archive-v1";
 #[derive(Debug)]
 pub(crate) struct PreparedTreeCheckpoint {
     source: PathBuf,
+    independent: Vec<PathBuf>,
     cleanup: CheckpointCleanup,
     #[cfg(target_os = "macos")]
     cloned: bool,
@@ -148,6 +149,14 @@ pub(crate) fn prepare_tree_checkpoint_in(
     source: &Path,
     parent: &Path,
 ) -> Result<PreparedTreeCheckpoint, String> {
+    prepare_scoped_tree_checkpoint_in(source, parent, &[])
+}
+
+pub(crate) fn prepare_scoped_tree_checkpoint_in(
+    source: &Path,
+    parent: &Path,
+    independent: &[PathBuf],
+) -> Result<PreparedTreeCheckpoint, String> {
     if !path_exists(source) {
         return Err(format!(
             "checkpoint source does not exist: {}",
@@ -156,16 +165,17 @@ pub(crate) fn prepare_tree_checkpoint_in(
     }
 
     #[cfg(target_os = "macos")]
-    let mut entries = prepare_entries(source)?;
+    let mut entries = prepare_entries(source, independent)?;
     #[cfg(not(target_os = "macos"))]
-    preflight_sqlite_databases(source)?;
+    preflight_sqlite_databases(source, independent)?;
 
     let cleanup = CheckpointCleanup::new(parent)?;
     #[cfg(target_os = "macos")]
     let cloned = {
         // This live copy is only a seed. Fingerprints were recorded BEFORE cloning;
         // capture must reconcile everything that changed before publishing it.
-        let cloned = clone_tree_checkpoint(source, &cleanup.candidate()).is_ok();
+        let cloned =
+            copy_selected_tree(source, source, &cleanup.candidate(), independent, true).is_ok();
         if !cloned {
             cleanup.retire(&cleanup.candidate())?;
         } else {
@@ -176,6 +186,7 @@ pub(crate) fn prepare_tree_checkpoint_in(
 
     Ok(PreparedTreeCheckpoint {
         source: source.to_path_buf(),
+        independent: independent.to_vec(),
         cleanup,
         #[cfg(target_os = "macos")]
         cloned,
@@ -206,18 +217,21 @@ pub(crate) fn create_tree_checkpoint_from_preparation(
             &candidate,
             prepared.entries,
             &prepared.cleanup,
+            &prepared.independent,
         )?;
         sync_tree_root(&candidate)?;
         fs::rename(&candidate, destination).map_err(|error| error.to_string())?;
         return Ok(STORAGE_APFS_CLONE.to_string());
-    } else {
-        copyfile_tree(&prepared.source, &candidate)?;
     }
 
-    #[cfg(not(target_os = "macos"))]
-    copy_tree_preserving_metadata(&prepared.source, &candidate)?;
-
-    verify_tree_checkpoint(&prepared.source, &candidate)?;
+    copy_selected_tree(
+        &prepared.source,
+        &prepared.source,
+        &candidate,
+        &prepared.independent,
+        false,
+    )?;
+    verify_selected_tree_checkpoint(&prepared.source, &candidate, &prepared.independent)?;
     verify_sqlite_databases(&candidate)?;
     sync_tree_root(&candidate)?;
     fs::rename(&candidate, destination).map_err(|error| error.to_string())?;
@@ -229,9 +243,22 @@ pub(crate) fn copy_tree_checkpoint(source: &Path, destination: &Path) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn verify_tree_checkpoint(source: &Path, destination: &Path) -> Result<(), String> {
-    let source_entries = inventory_tree(source)?;
-    let destination_entries = inventory_tree(destination)?;
+    verify_selected_tree_checkpoint(source, destination, &[])
+}
+
+fn verify_selected_tree_checkpoint(
+    source: &Path,
+    destination: &Path,
+    independent: &[PathBuf],
+) -> Result<(), String> {
+    let mut source_entries = inventory_tree_except(source, independent)?;
+    let mut destination_entries = inventory_tree(destination)?;
+    // Process endpoints have no durable payload. Keep this policy local to
+    // checkpoints; immutable runtime inventories must still reject sockets.
+    source_entries.retain(|_, entry| !entry.is_socket());
+    destination_entries.retain(|_, entry| !entry.is_socket());
     if source_entries != destination_entries {
         return Err(format!(
             "checkpoint verification failed: {} does not exactly match {}",
@@ -250,8 +277,8 @@ fn verify_sqlite_databases(root: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn preflight_sqlite_databases(root: &Path) -> Result<(), String> {
-    for path in regular_files(root)? {
+fn preflight_sqlite_databases(root: &Path, independent: &[PathBuf]) -> Result<(), String> {
+    for path in regular_files_except(root, independent)? {
         let _ = check_sqlite_database(&path)?;
     }
     Ok(())
@@ -315,9 +342,12 @@ fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn prepare_entries(root: &Path) -> Result<HashMap<Box<[u8]>, PreparedEntry>, String> {
+fn prepare_entries(
+    root: &Path,
+    independent: &[PathBuf],
+) -> Result<HashMap<Box<[u8]>, PreparedEntry>, String> {
     let mut out = HashMap::new();
-    prepare_entry_path(root, root, &mut out)?;
+    prepare_entry_path(root, root, independent, &mut out)?;
     Ok(out)
 }
 
@@ -325,8 +355,12 @@ fn prepare_entries(root: &Path) -> Result<HashMap<Box<[u8]>, PreparedEntry>, Str
 fn prepare_entry_path(
     root: &Path,
     path: &Path,
+    independent: &[PathBuf],
     out: &mut HashMap<Box<[u8]>, PreparedEntry>,
 ) -> Result<(), String> {
+    if independent.iter().any(|entry| path == root.join(entry)) {
+        return Ok(());
+    }
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -405,13 +439,37 @@ fn prepare_entry_path(
         };
         for entry in entries {
             match entry {
-                Ok(entry) => prepare_entry_path(root, &entry.path(), out)?,
+                Ok(entry) => prepare_entry_path(root, &entry.path(), independent, out)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.to_string()),
             }
         }
+        return Ok(());
     }
-    Ok(())
+    if is_socket(&metadata) {
+        return Ok(());
+    }
+    Err(unsupported_checkpoint_entry(path))
+}
+
+fn is_socket(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        metadata.file_type().is_socket()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn unsupported_checkpoint_entry(path: &Path) -> String {
+    format!(
+        "unsupported special file in checkpoint: {}",
+        display_path(path)
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -470,6 +528,7 @@ fn capture_prepared_clone(
     destination: &Path,
     mut prepared: HashMap<Box<[u8]>, PreparedEntry>,
     cleanup: &CheckpointCleanup,
+    independent: &[PathBuf],
 ) -> Result<(), String> {
     let mut candidates = HashSet::new();
     capture_prepared_path(
@@ -479,6 +538,7 @@ fn capture_prepared_clone(
         &mut prepared,
         &mut candidates,
         cleanup,
+        independent,
     )?;
     for (relative, prior) in prepared {
         let relative = PathBuf::from(std::ffi::OsStr::from_bytes(&relative).to_os_string());
@@ -536,9 +596,16 @@ fn capture_prepared_path(
     prepared: &mut HashMap<Box<[u8]>, PreparedEntry>,
     sqlite_candidates: &mut HashSet<PathBuf>,
     cleanup: &CheckpointCleanup,
+    independent: &[PathBuf],
 ) -> Result<bool, String> {
     use std::os::unix::fs::PermissionsExt;
 
+    if independent.iter().any(|entry| path == root.join(entry)) {
+        cleanup.retire(
+            &destination.join(path.strip_prefix(root).map_err(|error| error.to_string())?),
+        )?;
+        return Ok(false);
+    }
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
     let destination_path = destination.join(relative);
@@ -546,6 +613,12 @@ fn capture_prepared_path(
     let unchanged = prior
         .and_then(|entry| entry.fingerprint)
         .is_some_and(|fingerprint| fingerprint == file_fingerprint(&metadata));
+    if is_socket(&metadata) {
+        // A native seed can contain a socket inode, but restoring it cannot
+        // restore its process or connection. Retire only the candidate entry.
+        cleanup.retire(&destination_path)?;
+        return Ok(true);
+    }
     if metadata.file_type().is_symlink() {
         if unchanged {
             return Ok(false);
@@ -612,6 +685,7 @@ fn capture_prepared_path(
                 prepared,
                 sqlite_candidates,
                 cleanup,
+                independent,
             )?;
         }
         for entry in fs::read_dir(&destination_path).map_err(|error| error.to_string())? {
@@ -627,10 +701,7 @@ fn capture_prepared_path(
         }
         return Ok(created);
     }
-    Err(format!(
-        "unsupported special file in checkpoint: {}",
-        display_path(path)
-    ))
+    Err(unsupported_checkpoint_entry(path))
 }
 
 #[cfg(target_os = "macos")]
@@ -872,12 +943,24 @@ fn sqlite_primary_for_sidecar(path: &Path) -> Option<PathBuf> {
 }
 
 fn regular_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    regular_files_except(root, &[])
+}
+
+fn regular_files_except(root: &Path, independent: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
-    collect_regular_files(root, &mut out)?;
+    collect_regular_files(root, root, independent, &mut out)?;
     Ok(out)
 }
 
-fn collect_regular_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect_regular_files(
+    root: &Path,
+    path: &Path,
+    independent: &[PathBuf],
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if independent.iter().any(|entry| path == root.join(entry)) {
+        return Ok(());
+    }
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if metadata.file_type().is_symlink() {
         return Ok(());
@@ -888,10 +971,19 @@ fn collect_regular_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), Stri
     }
     if metadata.is_dir() {
         for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
-            collect_regular_files(&entry.map_err(|error| error.to_string())?.path(), out)?;
+            collect_regular_files(
+                root,
+                &entry.map_err(|error| error.to_string())?.path(),
+                independent,
+                out,
+            )?;
         }
+        return Ok(());
     }
-    Ok(())
+    if is_socket(&metadata) {
+        return Ok(());
+    }
+    Err(unsupported_checkpoint_entry(path))
 }
 
 fn sync_tree_root(root: &Path) -> Result<(), String> {
@@ -982,6 +1074,72 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
+/// Partition only ancestors of independent entries. Reuse the existing native
+/// clone/copy for owned subtrees without visiting the independent content.
+fn copy_selected_tree(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+    independent: &[PathBuf],
+    clone: bool,
+) -> Result<(), String> {
+    let relative = source
+        .strip_prefix(root)
+        .map_err(|error| error.to_string())?;
+    if independent.iter().any(|entry| entry == relative) {
+        return Ok(());
+    }
+    if independent.iter().any(|entry| entry.starts_with(relative)) {
+        let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "independent checkpoint path has a non-directory ancestor: {}",
+                display_path(source)
+            ));
+        }
+        fs::create_dir(destination).map_err(|error| error.to_string())?;
+        for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            copy_selected_tree(
+                root,
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                independent,
+                clone,
+            )?;
+        }
+        return copy_checkpoint_directory_metadata(source, destination);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if clone {
+            clone_tree_checkpoint(source, destination)
+        } else {
+            copy_checkpoint_tree(source, destination)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = clone;
+        copy_tree_preserving_metadata(source, destination)
+    }
+}
+
+pub(crate) fn copy_checkpoint_directory_metadata(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        copyfile_metadata(source, destination)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+        preserve_metadata(source, destination, &metadata, false)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn clone_tree_checkpoint(source: &Path, destination: &Path) -> Result<(), String> {
     use std::ffi::CString;
@@ -1018,6 +1176,30 @@ fn clone_tree_checkpoint(source: &Path, destination: &Path) -> Result<(), String
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn copy_checkpoint_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    if is_socket(&metadata) {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        // Native recursive copyfile rejects sockets before it can copy the
+        // durable siblings. Walk entries here, retaining native metadata copy.
+        ensure_dir(destination)?;
+        for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            copy_checkpoint_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        copyfile_metadata(source, destination)?;
+        preserve_special_mode(destination, &metadata)?;
+        return Ok(());
+    }
+    if metadata.is_file() || metadata.file_type().is_symlink() {
+        return copyfile_tree(source, destination);
+    }
+    Err(unsupported_checkpoint_entry(source))
 }
 
 #[cfg(target_os = "macos")]
@@ -1090,6 +1272,9 @@ fn copy_tree_preserving_metadata(source: &Path, destination: &Path) -> Result<()
 #[cfg(not(target_os = "macos"))]
 fn copy_path_preserving_metadata(source: &Path, destination: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    if is_socket(&metadata) {
+        return Ok(());
+    }
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
         let target = fs::read_link(source).map_err(|error| error.to_string())?;
@@ -1129,10 +1314,7 @@ fn copy_path_preserving_metadata(source: &Path, destination: &Path) -> Result<()
         preserve_metadata(source, destination, &metadata, false)?;
         return Ok(());
     }
-    Err(format!(
-        "unsupported special file in checkpoint: {}",
-        display_path(source)
-    ))
+    Err(unsupported_checkpoint_entry(source))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1166,6 +1348,8 @@ fn preserve_metadata(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileTypeExt;
     use std::path::Path;
 
     #[cfg(target_os = "macos")]
@@ -1174,6 +1358,231 @@ mod tests {
         prepare_tree_checkpoint, sqlite_primary_for_sidecar, verify_tree_checkpoint,
     };
     use crate::infra::tree_digest::inventory_tree;
+
+    #[test]
+    fn selected_checkpoint_never_reads_independent_databases_in_clone_or_full_copy() {
+        for full_copy in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let project = source.join("workspace/project");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(
+                project.join("arbitrary.data"),
+                b"SQLite format 3\0invalid database fixture",
+            )
+            .unwrap();
+            fs::write(source.join("owned"), b"runtime").unwrap();
+            let independent = [std::path::PathBuf::from("workspace/project")];
+            let prepared =
+                super::prepare_scoped_tree_checkpoint_in(&source, temp.path(), &independent)
+                    .unwrap();
+            #[cfg(target_os = "macos")]
+            let prepared = {
+                let mut prepared = prepared;
+                if full_copy {
+                    prepared
+                        .cleanup
+                        .retire(&prepared.cleanup.candidate())
+                        .unwrap();
+                    prepared.cloned = false;
+                }
+                prepared
+            };
+            #[cfg(not(target_os = "macos"))]
+            let _ = full_copy;
+            let destination = temp.path().join("snapshot");
+            super::create_tree_checkpoint_from_preparation(prepared, &destination).unwrap();
+            assert!(!destination.join("workspace/project").exists());
+            assert_eq!(fs::read(destination.join("owned")).unwrap(), b"runtime");
+            assert!(project.join("arbitrary.data").exists());
+            fs::write(
+                source.join("unknown.data"),
+                b"SQLite format 3\0invalid database fixture",
+            )
+            .unwrap();
+            assert!(
+                super::prepare_scoped_tree_checkpoint_in(&source, temp.path(), &independent)
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoints_skip_socket_endpoints_but_preserve_durable_entries() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        #[cfg(target_os = "macos")]
+        let variants = [false, true];
+        #[cfg(not(target_os = "macos"))]
+        let variants = [false];
+        for force_full_copy in variants {
+            let fixture = tempfile::Builder::new()
+                .prefix("ocms-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let source = fixture.path().join("source");
+            let destination = fixture.path().join("checkpoint");
+            fs::create_dir_all(source.join("nested")).unwrap();
+            let regular = source.join("nested/regular.sock");
+            fs::write(&regular, b"durable\0bytes").unwrap();
+            fs::set_permissions(&regular, fs::Permissions::from_mode(0o4750)).unwrap();
+            symlink("../endpoint", source.join("nested/socket-link")).unwrap();
+            fs::set_permissions(source.join("nested"), fs::Permissions::from_mode(0o1550)).unwrap();
+            let endpoint = source.join("endpoint");
+            let listener = UnixListener::bind(&endpoint).unwrap();
+            let inode = fs::symlink_metadata(&endpoint).unwrap().ino();
+            let stale = source.join("stale");
+            drop(UnixListener::bind(&stale).unwrap());
+            let prepared = super::prepare_tree_checkpoint(&source).unwrap();
+            #[cfg(target_os = "macos")]
+            let prepared = {
+                let mut prepared = prepared;
+                assert!(prepared.cloned);
+                if force_full_copy {
+                    prepared
+                        .cleanup
+                        .retire(&prepared.cleanup.candidate())
+                        .unwrap();
+                    prepared.cloned = false;
+                }
+                prepared
+            };
+            let storage =
+                super::create_tree_checkpoint_from_preparation(prepared, &destination).unwrap();
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                storage,
+                if force_full_copy {
+                    super::STORAGE_FULL_COPY
+                } else {
+                    super::STORAGE_APFS_CLONE
+                }
+            );
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = force_full_copy;
+                assert_eq!(storage, super::STORAGE_FULL_COPY);
+            }
+            super::verify_tree_checkpoint(&source, &destination).unwrap();
+            assert!(!destination.join("endpoint").exists());
+            assert!(!destination.join("stale").exists());
+            assert_eq!(fs::symlink_metadata(&endpoint).unwrap().ino(), inode);
+            assert!(
+                fs::symlink_metadata(&stale)
+                    .unwrap()
+                    .file_type()
+                    .is_socket()
+            );
+            assert_eq!(
+                fs::read(destination.join("nested/regular.sock")).unwrap(),
+                b"durable\0bytes"
+            );
+            assert_eq!(
+                fs::metadata(destination.join("nested/regular.sock"))
+                    .unwrap()
+                    .mode()
+                    & 0o7777,
+                0o4750
+            );
+            assert_eq!(
+                fs::metadata(destination.join("nested")).unwrap().mode() & 0o7777,
+                0o1550
+            );
+            assert_eq!(
+                fs::read_link(destination.join("nested/socket-link")).unwrap(),
+                Path::new("../endpoint")
+            );
+
+            let mut client = UnixStream::connect(&endpoint).unwrap();
+            let (mut server, _) = listener.accept().unwrap();
+            client.write_all(b"ok").unwrap();
+            let mut message = [0; 2];
+            server.read_exact(&mut message).unwrap();
+            assert_eq!(&message, b"ok");
+
+            fs::write(destination.join("nested/regular.sock"), b"corrupted").unwrap();
+            assert!(super::verify_tree_checkpoint(&source, &destination).is_err());
+            super::remove_tree_if_present(&source).unwrap();
+            super::remove_tree_if_present(&destination).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn checkpoint_reconciles_socket_file_type_changes_after_preparation() {
+        use std::os::unix::net::UnixListener;
+
+        for initially_socket in [false, true] {
+            let fixture = tempfile::Builder::new()
+                .prefix("ocms-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let source = fixture.path().join("source");
+            fs::create_dir(&source).unwrap();
+            let path = source.join("entry");
+            if initially_socket {
+                drop(UnixListener::bind(&path).unwrap());
+            } else {
+                fs::write(&path, b"before").unwrap();
+            }
+            let prepared = super::prepare_tree_checkpoint(&source).unwrap();
+            fs::remove_file(&path).unwrap();
+            if initially_socket {
+                fs::write(&path, b"after").unwrap();
+            } else {
+                drop(UnixListener::bind(&path).unwrap());
+            }
+            let destination = fixture.path().join("checkpoint");
+            super::create_tree_checkpoint_from_preparation(prepared, &destination).unwrap();
+            super::verify_tree_checkpoint(&source, &destination).unwrap();
+            if initially_socket {
+                assert_eq!(fs::read(destination.join("entry")).unwrap(), b"after");
+            } else {
+                assert!(!destination.join("entry").exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_refuses_fifos_during_preparation_and_final_capture() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        for before_preparation in [true, false] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("source");
+            fs::create_dir(&source).unwrap();
+            let fifo = source.join("unsupported");
+            let create_fifo = || {
+                let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            };
+            if before_preparation {
+                create_fifo();
+            }
+            let error = if before_preparation {
+                super::prepare_tree_checkpoint(&source).unwrap_err()
+            } else {
+                let prepared = super::prepare_tree_checkpoint(&source).unwrap();
+                create_fifo();
+                super::create_tree_checkpoint_from_preparation(
+                    prepared,
+                    &fixture.path().join("checkpoint"),
+                )
+                .unwrap_err()
+            };
+            assert!(
+                error.contains("unsupported special file in checkpoint"),
+                "{error}"
+            );
+            assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+            assert!(!fixture.path().join("checkpoint").exists());
+        }
+    }
 
     #[cfg(target_os = "macos")]
     fn directory_roundtrip_during_preparation(replacement: bool) {
@@ -1186,7 +1595,7 @@ mod tests {
             fs::create_dir_all(original.join("nested")).unwrap();
             fs::write(original.join("nested/value"), "original").unwrap();
             symlink("value", original.join("nested/link")).unwrap();
-            let mut entries = super::prepare_entries(&source).unwrap();
+            let mut entries = super::prepare_entries(&source, &[]).unwrap();
             let before = super::file_fingerprint(
                 &fs::symlink_metadata(original.join("nested/value")).unwrap(),
             );
@@ -1218,6 +1627,7 @@ mod tests {
                 )
             );
             let prepared = super::PreparedTreeCheckpoint {
+                independent: Vec::new(),
                 source: source.clone(),
                 cleanup,
                 cloned: true,

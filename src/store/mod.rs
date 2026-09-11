@@ -1,5 +1,9 @@
+mod checkpoint_scope;
 mod checkpoints;
 mod common;
+mod dev_registration;
+pub(crate) mod dev_sources;
+mod dev_ui_ports;
 mod envs;
 mod gateway_ports;
 mod launchers;
@@ -20,12 +24,19 @@ use crate::env::EnvMeta;
 use crate::env::EnvSummary;
 pub(crate) use checkpoints::CheckpointCleanup;
 pub(crate) use common::{
-    ExclusiveFileLock, copy_dir_recursive, ensure_dir, lock_file, read_json, write_json,
+    ExclusiveFileLock, copy_dir_recursive, ensure_dir, lock_file, read_json, try_lock_file,
+    write_json,
 };
-pub(crate) use envs::{EnvironmentOperationLock, lock_env_registry, lock_environment_operation};
+pub(crate) use dev_registration::{DevSourceRegistration, with_prepared_dev_source};
+pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
+pub(crate) use dev_ui_ports::reserve as reserve_dev_ui_port;
 pub(crate) use envs::{
-    EnvironmentServicePolicyChange, restore_environment_service_policy,
-    set_environment_service_policy,
+    EnvironmentOperationLock, lock_env_registry, lock_environment_operation,
+    remove_environment_locked,
+};
+pub(crate) use envs::{
+    EnvironmentServicePolicyChange, environment_service_policy_revision,
+    restore_environment_service_policy, set_environment_service_policy,
 };
 pub use envs::{
     clone_environment, create_environment, export_environment, get_environment, import_environment,
@@ -36,8 +47,8 @@ pub(crate) use envs::{
     create_environment_with_validated_runtime, import_environment_with_sandbox_origin,
 };
 pub(crate) use envs::{
-    save_environment_with_validated_launcher, save_environment_with_validated_runtime,
-    with_locked_environments,
+    save_environment_with_dev_registration, save_environment_with_validated_launcher,
+    save_environment_with_validated_runtime, with_locked_environments,
 };
 pub(crate) use gateway_ports::{
     openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,
@@ -55,10 +66,11 @@ pub use layout::{
 };
 pub(crate) use openclaw_config::{
     OpenClawConfigAudit, audit_openclaw_config, clear_skip_bootstrap_for_openclaw_onboarding,
-    ensure_minimum_local_openclaw_config, normalize_new_environment_sandbox_origin,
-    openclaw_config_include_paths, openclaw_config_uses_includes,
-    reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
-    repair_openclaw_config, rewrite_external_workspace_paths_for_migration,
+    dev_ui_gateway_url, ensure_minimum_local_openclaw_config,
+    normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
+    openclaw_config_uses_includes, reject_include_owned_agent_workspaces,
+    reject_include_owned_sandbox_origin, repair_openclaw_config,
+    rewrite_external_workspace_paths_for_migration,
     rewrite_identity_bound_workspace_paths_for_target, rewrite_openclaw_config_for_migration,
     rewrite_openclaw_config_for_new_environment, rewrite_openclaw_config_for_simulation,
     rewrite_openclaw_config_for_target, rewrite_openclaw_config_includes_for_target,
@@ -84,8 +96,10 @@ pub use runtimes::{
 };
 pub(crate) use snapshots::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
-    create_env_snapshot_from_preparation, prepare_env_snapshot_capture,
-    prepare_env_snapshot_restore, rollback_env_snapshot_restore,
+    create_env_snapshot_from_preparation, ensure_restore_preserves_dev_sources,
+    prepare_env_snapshot_capture, prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
+    prepare_upgrade_snapshot_restore, rollback_env_snapshot_restore,
+    validate_upgrade_independent_paths,
 };
 pub use snapshots::{
     create_env_snapshot, get_env_snapshot, list_all_env_snapshots, list_env_snapshots,
@@ -127,13 +141,15 @@ pub fn summarize_env(meta: &EnvMeta) -> EnvSummary {
         state_dir: display_path(&paths.state_dir),
         config_path: display_path(&paths.config_path),
         workspace_dir: display_path(&paths.workspace_dir),
+        upgrade_independent_paths: meta.upgrade_independent_paths.clone(),
         gateway_port: meta.gateway_port,
         service_enabled: meta.service_enabled,
         service_running: meta.service_running,
         default_runtime: meta.default_runtime.clone(),
         default_launcher: meta.default_launcher.clone(),
-        dev_repo_root: meta.dev.as_ref().map(|dev| dev.repo_root.clone()),
-        dev_worktree_root: meta.dev.as_ref().map(|dev| dev.worktree_root.clone()),
+        dev_repo_root: meta.dev.as_ref().map(|dev| dev.repo_root().to_string()),
+        dev_worktree_root: meta.dev.as_ref().map(|dev| dev.source_root().to_string()),
+        dev_ui_port: meta.dev_ui_port,
         protected: meta.protected,
         created_at: meta.created_at,
         last_used_at: meta.last_used_at,
