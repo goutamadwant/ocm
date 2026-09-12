@@ -133,6 +133,12 @@ reservation. Removing the environment releases it. `ocm dev status luna` reports
 the address. On Linux, macOS, and Windows, a matching repeated start requests a
 fresh native browser grant from the existing controller without restarting
 Gateway or Vite. Busy or unready requests report a pending link.
+Templated `gateway.controlUi.basePath` values are resolved by the selected
+checkout's native config command before startup, including OpenClaw's `.env`
+and config environment rules. The private read preserves the authored config,
+and repeated starts keep the original controller's resolved target. If variables
+remain unresolved, supply them or use a concrete base path before retrying;
+`--no-ui` still starts the Gateway without a UI target.
 Older OCM controllers retain address-only reuse and report fresh links as
 unavailable until that dev session is restarted.
 `ocm dev stop luna` stops the components together. A pending initial request gets
@@ -372,6 +378,36 @@ that service registration and repair are managed outside OpenClaw in this
 context. Commands like `openclaw doctor --fix` can still repair normal env
 state, but background service lifecycle should be handled with `ocm service`.
 
+### Export one bounded artifact
+
+On Unix, export a file relative to an environment's `OPENCLAW_HOME` without
+executing an environment command:
+
+```bash
+ocm env artifact export mira \
+  --path .openclaw/openclaw.json --max-bytes 1048576 > config.json
+```
+
+`--path` and the nonnegative decimal `--max-bytes` are required. stdout contains
+only the raw file bytes; errors go to stderr. There is no destination option.
+The caller owns the destination and must discard it on a nonzero exit, including
+any partial bytes. Consumers must independently limit incoming bytes and time.
+
+The registered environment home must be a directory, not a symlink. Beneath
+that home, OCM opens each component relative to pinned directory descriptors
+and rejects traversal, symlinks, nonregular files and files with multiple hard
+links. It checks the file's size, identity, link count and modification/change
+timestamps before and after reading, and rejects observed changes or leaf
+replacement. This detects instability, but is not an atomic snapshot or an
+attestation of candidate-produced data. Stop the producer before exporting
+final diagnostics.
+
+The command uses the invoking OCM user's permissions and does not change service
+or environment state. When crossing user boundaries, run the whole OCM command
+as the environment owner; the receiving process retains destination ownership.
+Non-Unix platforms fail closed because this command requires descriptor-relative
+no-follow access. Existing archive export and other commands are unchanged.
+
 ## Service management
 
 Use `service` when an environment should run in the background.
@@ -482,8 +518,20 @@ ocm self update --check
 
 ## Environment lifecycle
 
-Environment creation, including `start` and migration, and `env clone` and
-`env import` require a root outside registered dev sources. Missing borrowed
+New environment roots must be separate. A root cannot equal, contain, or sit
+inside another registered environment root, including through path aliases.
+OCM rejects overlap before creating or copying environment state or registering
+the new environment, regardless of protection flags. Default sibling roots and
+disjoint custom roots remain valid. This applies to `env create`, `env clone`,
+`env import`, and new environments created by `start`, `setup`, `dev`, `migrate`,
+`adopt import`, or upgrade simulation.
+
+A registered root remains reserved while its directory is missing. Disjoint
+Unicode roots remain valid; case and normalization aliases of a missing root
+are still reserved. On Windows, an ambiguous missing 8.3 short name requires
+restoring the registered path before retrying.
+
+These operations also require a root outside registered dev sources. Missing borrowed
 source paths remain reserved until their binding is removed; missing paths of
 OCM-owned worktrees can still be reused. The root must neither contain
 a registered source nor be inside it. OCM resolves source and destination aliases and also protects source
@@ -514,13 +562,26 @@ their directories before the upgrade:
 
 ```bash
 ocm env set-independent-paths mira .openclaw/workspace/projects .openclaw/workspace/worktrees
+# Include separately located managed worktrees and a development checkout:
+ocm env set-independent-paths mira .openclaw/workspace/projects .openclaw/worktrees development/checkouts
 ocm env show mira --json
 ocm env set-independent-paths mira none
 ```
 
-The command replaces the list. Paths are relative to the environment root, must
-be strictly beneath a configured workspace, and must name directories. A declared
-directory may be absent if its parents exist. Parents must be real directories;
+The command replaces the list. Paths are relative to the environment root and
+must name directories in one of these locations:
+
+- strictly beneath a configured workspace;
+- the managed-worktree content directory `.openclaw/worktrees`, or beneath it;
+- a non-hidden top-level directory of the environment home, or beneath it.
+
+Other hidden home/state directories remain ineligible. For example, `.openclaw/agents`,
+`.openclaw/credentials`, `.openclaw/state`, and `.codex` cannot be excluded. The
+managed-worktree registry and migration state remain in the state database, not
+in the excluded checkout contents. These locations are eligibility rules only:
+no content is excluded without an explicit declaration.
+
+A declared directory may be absent if its parents exist. Parents must be real directories;
 symlinks within an independent directory remain untouched. Individual files cannot
 be declared independently, keeping SQLite databases and their adjacent WAL and
 journal files together. Paths cannot overlap, escape the environment, contain
@@ -695,6 +756,18 @@ be cleared by repeating stop, starting another watch/service, or destroying the
 env. Normal acknowledged errors remain retryable; released legacy watch records
 and Windows process-job recovery retain their existing rules. Use a compatible
 OCM CLI and refresh an older running daemon before creating a new generation.
+
+If a stopped controller retained a cleanup failure, first independently verify
+that every source process, including detached workers, has stopped. Then run
+`ocm dev stop <env> --acknowledge-stopped-processes` to release that failed
+session. An empty recorded process group alone does not establish that detached
+workers stopped. OCM refuses recovery while its controller, recorded children,
+process groups, or lease are active, or when child ownership is unpublished or
+the environment/process scope changed. Recovery preserves the checkout, config,
+and current service policy; it does not signal processes or restart a service.
+`--json` retains the stop summary with `serviceRestored: false`. After recovery,
+normal dev retry and environment removal are available. Start the background
+service separately if wanted.
 
 `dev <env>` owns setup, the native Gateway watcher and Vite UI by default.
 `--no-watch` uses `scripts/run-node.mjs` instead of `scripts/watch-node.mjs` for

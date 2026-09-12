@@ -156,6 +156,14 @@ OCM prints the session's UI address, then its initial native owner link after
 both Vite and the Gateway Control UI document are ready. The native handoff keeps
 the Gateway identity and credentials; only the browser document moves to Vite.
 UI requires a local HTTP Gateway with Control UI enabled and installed UI dependencies.
+For a templated `gateway.controlUi.basePath` such as `${UI_BASE}`, OCM reads the
+effective path through the selected checkout's native config command. OpenClaw
+resolves its environment, `.env` files, and config-provided variables; OCM keeps
+that read private and leaves the authored config unchanged. An unresolved
+placeholder is an error: supply its value or use a concrete path before retrying.
+The resolved target stays captured for the session, including repeated starts
+from terminals with different environment variables. Literal paths need no
+additional config command.
 `--service` uses the background workflow without foreground watching or UI and
 rejects explicit `--watch` or `--ui`.
 
@@ -240,6 +248,10 @@ directories as independent before upgrading:
 ```bash
 ocm env set-independent-paths mira .openclaw/workspace/projects
 ```
+
+Explicit declarations also support `.openclaw/worktrees` and non-hidden
+development directories elsewhere in the environment home. Other hidden
+home/state namespaces, including credentials and the state database, stay protected.
 
 Upgrade checkpoints then omit those directories without reading their contents,
 and rollback restores the surrounding owned state while leaving those directories
@@ -388,10 +400,18 @@ install/stop/start cycle.
 
 For new Unix foreground generations, output readers must finish before OCM clears child ownership. A read failure, missing output completion, raw termination signal, or lost controller retains an unfinished session. Stopping a matching process group alone cannot prove detached workers stopped; subsequent stop, watch, service-start, and destroy requests preserve that uncertainty. Ordinary acknowledged errors remain retryable after output completes. Onboarding keeps real terminal output: unsuccessful or cancelled onboarding without observed output remains unfinished, while successful interactive onboarding still works. Released legacy watch records retain their existing recovery rules, and Windows keeps its process-job cleanup proof. Unknown or pending ownership still requires operator verification. Use an updated OCM CLI and refresh an incompatible running daemon before starting a new foreground generation; updating files does not refresh an old process.
 
+After independently verifying that **all source processes, including detached workers, have stopped**, recover a retained cleanup failure with `ocm dev stop <env> --acknowledge-stopped-processes`. OCM still refuses a running controller, recorded child or process group, a held lease, unpublished child ownership, or changed environment/process scope. Recovery releases only the matching failed session; it preserves source, config, and current service policy without signaling processes or restarting a background service. You can then retry dev or remove the environment normally. Start a background service separately if needed. An empty process group by itself is not enough to make this acknowledgement.
+
 `ocm env destroy <env> --yes` stops the recorded foreground generation and verifies shutdown before removing the environment. It rechecks the binding after stopping and preserves state if another owner or binding appears. While a watch is running, previews defer the changing process-tree inspection until after shutdown (`processInspectionDeferred` in JSON). `env remove` and `env prune` refuse active or unfinished watches; stop those sessions first. A guarded destroy with `--if-state-token` also requires `dev stop` followed by a fresh preview, so its original state guarantee remains intact. Completed watch records are removed with the env; synchronization lock files remain reusable.
 
-Environment creation, cloning, and import reject roots that overlap registered
-dev sources, including source and destination aliases. Missing borrowed paths
+New environment roots must be separate: a root cannot equal, contain, or sit
+inside another registered environment root, including through path aliases.
+Creation, cloning, import, and other commands that create an environment reject
+overlap before writing environment state, regardless of protection flags.
+Default sibling roots and disjoint custom roots remain valid.
+
+These operations also reject roots that overlap registered dev sources,
+including source and destination aliases. Missing borrowed paths
 remain reserved until their binding is removed. Removing a borrowed environment
 preserves its source, dependencies, generated output, and unrelated source workers.
 Restore and rollback also preserve borrowed source and known Git metadata;

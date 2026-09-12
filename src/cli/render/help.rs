@@ -197,6 +197,7 @@ pub fn setup_help(cmd: &str) -> String {
         vec![format!("{cmd} setup")],
         &[
             "Setup asks a few questions, then runs the same env-first flow as `start`.",
+            "A new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
             "Official release choices prefer host Node.js 22.22.3+, 24.15.0+, or 25.9.0+ and npm, and OCM can manage a private copy on supported platforms when they are missing.",
             "If git is missing, setup can offer to install it for repo-aware coding workflows.",
             "When run inside an OpenClaw checkout, local mode defaults to `pnpm openclaw` in that folder.",
@@ -243,7 +244,7 @@ pub fn logs_help(cmd: &str) -> String {
 pub fn dev_help(cmd: &str) -> String {
     render_group(
         "Development envs",
-        "Run the selected OpenClaw checkout with separate environment state, bootstrap the minimum local config, and run the native Gateway watcher and live UI in the foreground by default with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. Background service installation, start, and restart are refused while source watch is active. Before new foreground sessions or service preparation, any running managed daemon must be compatible and have verified process ownership; wait for startup or run service refresh-daemon --acknowledge-gateway-restarts from the updated OCM installation during a maintenance window. Confirmed stopped or unloaded daemons do not require refresh. New envs borrow the exact --repo checkout or the checkout enclosing the current directory without creating a Git worktree. Main and registered linked checkouts are supported. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source; borrowed envs refuse a different explicit or enclosing checkout. New borrowers may install missing tooling with pnpm install --frozen-lockfile; resumed borrowers require explicit preparation. Removing a borrower preserves its checkout and unrelated source workers. A running managed daemon must support new borrowed bindings; older OCM versions cannot read them. Repeating an invocation with matching source and effective backend watching/UI choices returns the existing session status and link without setup or restart. Starting and restoring sessions report progress; they are not reported as ready. Stop the session before onboarding or changing backend watching/UI choices, source, root, or port. Reuse keeps the captured launch endpoint; an older watch without endpoint metadata must be stopped from its original terminal first. Backend watching and native Vite UI are enabled by default. Use --no-watch to disable automatic backend rebuilds, --no-ui to disable Vite, or both for a plain foreground Gateway. Explicit --watch and --ui remain accepted; each conflicts with its negative counterpart. --service uses the background workflow without foreground watching or UI and rejects explicit --watch or --ui. --force requires backend watching and cannot be combined with --no-watch or --service. The controller owns both components and each native browser handoff. UI requires HTTP, enabled Control UI and installed UI dependencies; use --no-ui for TLS or disabled-UI environments. The initial owner link is printed after both documents are ready. A pending request keeps its one helper owned, discards late grant bytes after 30 seconds, and leaves Gateway and Vite running. On Linux, macOS, and Windows, matching reuse requests a fresh native grant from the existing controller without restarting either component; busy or unready requests report a pending link. Requests have a 30-second deadline, and disconnected callers never redirect their eventual grants to another terminal. Older OCM controllers retain address-only reuse and report fresh links as unavailable; stop and restart that dev session to enable them. Stop before changing UI mode. The UI address is retained across stop/start for that environment; an occupied or reserved address must be freed before retrying. Clone and import select their own addresses, restore keeps the current address, and environment removal releases its reservation.",
+        "Run the selected OpenClaw checkout with separate environment state, bootstrap the minimum local config, and run the native Gateway watcher and live UI in the foreground by default with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. Background service installation, start, and restart are refused while source watch is active. Before new foreground sessions or service preparation, any running managed daemon must be compatible and have verified process ownership; wait for startup or run service refresh-daemon --acknowledge-gateway-restarts from the updated OCM installation during a maintenance window. Confirmed stopped or unloaded daemons do not require refresh. New environment roots must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap. New envs borrow the exact --repo checkout or the checkout enclosing the current directory without creating a Git worktree. Main and registered linked checkouts are supported. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source; borrowed envs refuse a different explicit or enclosing checkout. New borrowers may install missing tooling with pnpm install --frozen-lockfile; resumed borrowers require explicit preparation. Removing a borrower preserves its checkout and unrelated source workers. A running managed daemon must support new borrowed bindings; older OCM versions cannot read them. Repeating an invocation with matching source and effective backend watching/UI choices returns the existing session status and link without setup or restart. Starting and restoring sessions report progress; they are not reported as ready. Stop the session before onboarding or changing backend watching/UI choices, source, root, or port. Reuse keeps the captured launch endpoint; an older watch without endpoint metadata must be stopped from its original terminal first. Backend watching and native Vite UI are enabled by default. Use --no-watch to disable automatic backend rebuilds, --no-ui to disable Vite, or both for a plain foreground Gateway. Explicit --watch and --ui remain accepted; each conflicts with its negative counterpart. --service uses the background workflow without foreground watching or UI and rejects explicit --watch or --ui. --force requires backend watching and cannot be combined with --no-watch or --service. The controller owns both components and each native browser handoff. UI requires HTTP, enabled Control UI and installed UI dependencies; use --no-ui for TLS or disabled-UI environments. The initial owner link is printed after both documents are ready. A pending request keeps its one helper owned, discards late grant bytes after 30 seconds, and leaves Gateway and Vite running. On Linux, macOS, and Windows, matching reuse requests a fresh native grant from the existing controller without restarting either component; busy or unready requests report a pending link. Requests have a 30-second deadline, and disconnected callers never redirect their eventual grants to another terminal. Older OCM controllers retain address-only reuse and report fresh links as unavailable; stop and restart that dev session to enable them. Stop before changing UI mode. The UI address is retained across stop/start for that environment; an occupied or reserved address must be freed before retrying. Clone and import select their own addresses, restore keeps the current address, and environment removal releases its reservation.",
         vec![format!(
             "{cmd} dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch | --no-watch] [--ui | --no-ui] [--force] [--service] [--onboard]"
         )],
@@ -284,11 +285,17 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
         "stop" => Some(render_leaf(
             "Stop foreground dev session",
             "Ask the recorded dev controller to stop its setup, Gateway and optional UI processes, including --service preparation. Preserve the env, source checkout, dependencies, and configuration; report unverified completion without discarding ownership.",
-            vec![format!("{cmd} dev stop <env> [--raw] [--json]")],
+            vec![format!(
+                "{cmd} dev stop <env> [--acknowledge-stopped-processes] [--raw] [--json]"
+            )],
             &[
                 (
                     "<env>",
                     "Environment whose foreground dev session should stop",
+                ),
+                (
+                    "--acknowledge-stopped-processes",
+                    "Recover failed ownership after independently verifying that all source processes, including detached workers, have stopped",
                 ),
                 ("--raw", "Print plain output"),
                 (
@@ -306,6 +313,7 @@ pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
                 "For UI sessions, persistent components stop first; a dashboard helper can use only the remaining original 30-second request budget. Unverified cleanup keeps ownership.",
                 "For new Unix foreground generations, a lost controller, raw termination signal, or incomplete output retains unfinished ownership even if the recorded process group stops. Stop/reuse/service-start/destroy cannot erase that uncertainty. Released legacy records keep their recovery rules.",
                 "Ordinary acknowledged errors remain retryable after output completes. Onboarding keeps real terminal output; cancellation or failure without observed output retains ownership, while successful onboarding remains supported.",
+                "After verifying all source workers have stopped, --acknowledge-stopped-processes releases a retained cleanup failure. It refuses active controllers, recorded children or process groups, held leases, pending child ownership, and changed environment/process scope. It does not signal processes or restart services; current service policy is preserved. Start a background service separately when wanted.",
                 "During Unix foreground preparation, pnpm lifecycle reports distinguish completed install errors from interrupted or unfinished build scripts; uncertain script cleanup retains ownership even if pnpm returns an ordinary error or succeeds after an optional build. Installer stdin stays interactive when run from a terminal; human output is streamed.",
                 "On Windows, recovery cannot verify a controller crash before child ownership is published; that unfinished session is retained for operator recovery.",
                 "After updating OCM, refresh an older running daemon from that installation with service refresh-daemon --acknowledge-gateway-restarts so it understands the current foreground ownership and completion records.",
@@ -367,6 +375,7 @@ pub fn migrate_help(cmd: &str) -> String {
         &[
             "Without an explicit source path, OCM imports from the default plain OpenClaw home under the current user home.",
             "Migrate preserves config, auth, sessions, logs, and other durable user state, rewrites env-scoped paths for the new managed root, and clears only live runtime residue like locks, pid files, and sockets.",
+            "The new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
             "A copied public MCP app sandbox origin is removed unless --sandbox-origin supplies a dedicated origin for the new env.",
             "If the config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin is owned by $include, flatten that section before migrating so OCM can reset the origin without changing include ownership.",
             "If `openclaw` is already available on PATH, migrate also binds the imported env to an env-local migrated launcher so you can keep going through OCM immediately.",
@@ -432,6 +441,7 @@ pub fn adopt_command_help(cmd: &str, action: &str) -> Option<String> {
             &[
                 "Without an explicit source path, OCM imports from the default plain OpenClaw home under the current user home.",
                 "This creates a managed env and rewrites env-scoped OpenClaw paths for the new target.",
+                "The new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
                 "A copied public MCP app sandbox origin is removed unless --sandbox-origin supplies a dedicated origin for the new env.",
                 "If the config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin is owned by $include, flatten that section before importing so OCM can reset the origin without changing include ownership.",
                 "If `openclaw` is already available on PATH, import also binds the env to an env-local migrated launcher so it is immediately runnable through OCM.",
@@ -550,6 +560,7 @@ pub fn start_help(cmd: &str) -> String {
         &[
             "If an environment already exists, start reuses it and only adjusts binding/protection when you asked for it.",
             "Start writes the minimum local config by default so the env can boot immediately. Use `--onboard` for the interactive setup flow.",
+            "A new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
             "Start installs and starts the env service by default. Use `--no-service` when you do not want a background process.",
             "Managed services currently support launchd on macOS and systemd --user on Linux.",
             "Official release selectors prefer host Node.js 22.22.3+, 24.15.0+, or 25.9.0+ and npm, and OCM can manage a private copy on supported platforms when they are missing.",
@@ -840,6 +851,10 @@ pub fn env_help(cmd: &str) -> String {
                 "Portability",
                 &[
                     ("export", "Export an environment archive"),
+                    (
+                        "artifact export",
+                        "Export one bounded file to stdout (Unix)",
+                    ),
                     ("import", "Import an environment archive"),
                 ],
             ),
@@ -853,6 +868,30 @@ pub fn env_help(cmd: &str) -> String {
             format!("{cmd} help env create"),
             format!("{cmd} help env run"),
             format!("{cmd} help env snapshot"),
+        ],
+    )
+}
+
+pub fn env_artifact_help(cmd: &str) -> String {
+    render_leaf(
+        "Export an environment artifact",
+        "Read one regular file beneath the environment home on Unix.",
+        vec![format!(
+            "{cmd} env artifact export <name> --path <relative-path> --max-bytes <bytes>"
+        )],
+        &[
+            ("--path <relative-path>", "File relative to OPENCLAW_HOME"),
+            ("--max-bytes <bytes>", "Required nonnegative byte limit"),
+        ],
+        vec![format!(
+            "{cmd} env artifact export mira --path .openclaw/openclaw.json --max-bytes 1048576 > config.json"
+        )],
+        &[
+            "stdout contains raw file bytes only; errors go to stderr.",
+            "Rejects traversal, symlinks, nonregular files, multiple hard links, and observed file changes.",
+            "Discard all output on a nonzero exit, including any partial bytes.",
+            "The caller owns its destination and must independently bound incoming bytes and time.",
+            "This does not attest candidate data or execute any environment command.",
         ],
     )
 }
@@ -1171,6 +1210,8 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Environments are the main isolation unit in OCM.",
+                "The new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
+                "OCM checks root overlap before creating or copying environment state.",
                 "The root must not overlap registered dev sources, including aliases and missing borrowed paths.",
                 "Computed gateway ports reserve the full local OpenClaw port family and skip the machine-wide OpenClaw config when present.",
                 "Use exactly one of `--runtime`, `--version`, or `--channel`.",
@@ -1201,6 +1242,8 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             &[
                 "Clone resets environment identity while preserving the copied workspace and env config.",
                 "Dev source bindings are not copied.",
+                "The new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
+                "OCM checks root overlap before creating or copying environment state.",
                 "The destination root must not overlap registered dev sources, including aliases and missing borrowed paths.",
                 "Clone assigns a fresh gateway port to the new env to avoid collisions.",
                 "Computed gateway ports reserve the full local OpenClaw port family and skip the machine-wide OpenClaw config when present.",
@@ -1254,6 +1297,8 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             &[
                 "Imported environments get a fresh identity in the central env registry.",
+                "The new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
+                "OCM checks root overlap before creating or copying environment state.",
                 "The destination root must not overlap registered dev sources, including aliases and missing borrowed paths.",
                 "Import rewrites env-scoped OpenClaw config paths for the new root.",
                 "Import removes a copied public MCP app sandbox origin unless --sandbox-origin supplies a dedicated origin for the imported env.",
@@ -1444,7 +1489,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
         ),
         "set-independent-paths" => render_leaf(
             "Set independent upgrade paths",
-            "Declare content beneath configured workspaces that core upgrades must not checkpoint or rewind. This replaces the previous list; use none to clear it.",
+            "Declare independent development directories that core upgrades must not checkpoint or rewind. This replaces the previous list; use none to clear it.",
             vec![
                 format!("{cmd} env set-independent-paths <name> <relative-path>... [--json]"),
                 format!("{cmd} env set-independent-paths <name> none [--json]"),
@@ -1455,6 +1500,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             &[
                 "Paths name directories relative to the environment root. Configuration, config includes and entire configured workspaces cannot be declared independent.",
+                "Eligible locations are beneath configured workspaces, in .openclaw/worktrees, or in non-hidden environment-home directories. Other hidden home/state namespaces remain protected.",
                 "Declare only content that core and plugin migrations do not own. OCM does not sandbox runtime writes into declared paths.",
                 "Full snapshots still include these paths. Existing checkpoints keep the scope recorded when they were captured.",
             ],

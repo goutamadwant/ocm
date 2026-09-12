@@ -151,12 +151,18 @@ fn create_clone_and_import_reject_registered_dev_source_destinations() {
         assert!(case_result.status.success(), "{}", stderr(&case_result));
     }
 
-    // The originating repo, a source's sibling, and another env's root retain
-    // their existing custom-root behavior; only registered source overlaps fail.
+    let nested = Path::new(&template.root).join("nested");
+    let rejected = create("nested-state", Some(&nested), None, &env, cwd).unwrap_err();
+    assert!(
+        rejected.contains("overlaps environment template root"),
+        "{rejected}"
+    );
+    assert!(!nested.exists());
+
+    // Separate roots in the originating repo and beside a source remain valid.
     for (name, destination) in [
         ("repo-state", fixture.child("repo/state")),
         ("source-sibling", fixture.child("repo/worktree-other")),
-        ("nested-state", Path::new(&template.root).join("nested")),
     ] {
         let created = run_ocm(
             cwd,
@@ -216,6 +222,37 @@ fn borrowed(source: &Path) -> EnvDevMeta {
     EnvDevMeta::Borrowed {
         source_root: path_string(source),
     }
+}
+
+#[test]
+fn missing_unicode_borrowed_sources_preserve_aliases_and_allow_siblings() {
+    let fixture = TestDir::new("missing-unicode-borrowed-source");
+    let cwd = fixture.path();
+    let env = ocm_env(&fixture);
+    let source = init_checkout(&fixture.child("projects/café-source"));
+    create("developer", None, Some(borrowed(&source)), &env, cwd).unwrap();
+    let retained = fixture.child("retained");
+    fs::rename(&source, &retained).unwrap();
+    let registry = env_registry_path(&env, cwd).unwrap();
+    let before = fs::read(&registry).unwrap();
+
+    for destination in [
+        source.clone(),
+        source.with_file_name("CAFE\u{301}-SOURCE").join("state"),
+    ] {
+        let error = create("blocked", Some(&destination), None, &env, cwd).unwrap_err();
+        assert!(error.contains("overlaps borrowed source"), "{error}");
+        assert_eq!(fs::read(&registry).unwrap(), before);
+        assert!(!destination.exists());
+    }
+    let sibling = source.with_file_name("日本語の環境ルート");
+    create("sibling", Some(&sibling), None, &env, cwd).unwrap();
+    assert!(sibling.join(".openclaw/workspace").is_dir());
+    assert!(!source.exists());
+    assert_eq!(
+        fs::read_to_string(retained.join("scripts/run-node.mjs")).unwrap(),
+        "// retained source\n"
+    );
 }
 
 #[test]
@@ -279,12 +316,22 @@ fn missing_borrowed_sources_remain_reserved_until_the_binding_is_removed() {
             assert!(!source.exists());
         }
     }
-    for (name, destination) in [
-        ("sibling", source.with_file_name("sibling")),
-        ("nested", Path::new(&template.root).join("nested")),
-    ] {
-        create(name, Some(&destination), None, &env, cwd).unwrap();
-    }
+    let nested = Path::new(&template.root).join("nested");
+    let rejected = create("nested", Some(&nested), None, &env, cwd).unwrap_err();
+    assert!(
+        rejected.contains("overlaps environment template root"),
+        "{rejected}"
+    );
+    assert_eq!(fs::read(&registry).unwrap(), before);
+    assert!(!nested.exists());
+    create(
+        "sibling",
+        Some(&source.with_file_name("sibling")),
+        None,
+        &env,
+        cwd,
+    )
+    .unwrap();
     let removed = run_ocm(cwd, &env, &["env", "remove", "developer", "--force"]);
     assert!(removed.status.success(), "{}", stderr(&removed));
     create("reused", Some(&source), None, &env, cwd).unwrap();
