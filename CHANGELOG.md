@@ -40,6 +40,7 @@ All notable changes to OCM are documented here.
 ### Fixed
 
 - Accept reformatted and binary macOS LaunchAgent plists for the same OCM store while still rejecting foreign or invalid owners. Thanks @TheAngryPit (#147, #149).
+- Reject mixed or malformed candidate preflight failures instead of treating an unsupported-check marker as success. Thanks @shakkernerd for the report and @goutamadwant for the fix (#128, #165).
 - Keep npm-owned executable updates with npm, prevent temporary npx caches from
   owning background services, and preserve process identity during npm-launched
   gateway refreshes. Protect managed and symlinked installer destinations even
