@@ -1,8 +1,15 @@
 use std::io::Read;
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +25,7 @@ use crate::infra::shell::{
 const PROTOCOL: &str = "openclaw.gateway.restart-handoff";
 const PROTOCOL_VERSION: u8 = 1;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +82,18 @@ struct ConsumedHandoff {
 struct CommandOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
+}
+
+enum ChildCompletion {
+    #[cfg(unix)]
+    ExitedUnreaped,
+    #[cfg(not(unix))]
+    Reaped(ExitStatus),
+}
+
+struct CommandProcessGuard {
+    #[cfg(windows)]
+    job: windows_sys::Win32::Foundation::HANDLE,
 }
 
 pub(super) fn probe_restart_handoff_support(spec: &SupervisorChildSpec) -> RestartHandoffSupport {
@@ -206,6 +226,16 @@ fn run_openclaw_machine_command(
     spec: &SupervisorChildSpec,
     openclaw_args: &[&str],
 ) -> Result<CommandOutput, String> {
+    run_openclaw_machine_command_with_timeout(spec, openclaw_args, COMMAND_TIMEOUT)
+}
+
+fn run_openclaw_machine_command_with_timeout(
+    spec: &SupervisorChildSpec,
+    openclaw_args: &[&str],
+    timeout: Duration,
+) -> Result<CommandOutput, String> {
+    let started_at = Instant::now();
+    let deadline = started_at + timeout;
     let program_arguments = openclaw_program_arguments(spec, openclaw_args)?;
     let program = program_arguments
         .first()
@@ -219,40 +249,417 @@ fn run_openclaw_machine_command(
         .env_clear()
         .envs(&spec.process_env)
         .current_dir(Path::new(&spec.run_dir));
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-    }
+    let process_guard = CommandProcessGuard::new()?;
+    process_guard.configure_command(&mut command);
     let mut child = command.spawn().map_err(|error| {
         format!(
             "failed running restart-handoff command for env \"{}\": {error}",
             spec.env_name
         )
     })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "restart-handoff command stdout was not captured".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "restart-handoff command stderr was not captured".to_string())?;
-    let stdout_reader = thread::spawn(move || read_bounded(stdout));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr));
+    if let Err(error) = process_guard.assign_and_start(&mut child) {
+        let _ = process_guard.terminate(&mut child);
+        return Err(error);
+    }
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            return Err(error_with_cleanup(
+                "restart-handoff command stdout was not captured".to_string(),
+                process_guard.terminate(&mut child),
+            ));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            return Err(error_with_cleanup(
+                "restart-handoff command stderr was not captured".to_string(),
+                process_guard.terminate(&mut child),
+            ));
+        }
+    };
+    #[cfg(unix)]
+    if let Err(error) = set_nonblocking(&stdout).and_then(|_| set_nonblocking(&stderr)) {
+        return Err(error_with_cleanup(
+            format!("failed configuring restart-handoff output capture: {error}"),
+            process_guard.terminate(&mut child),
+        ));
+    }
+    let stdout_reader = spawn_output_reader(stdout, deadline);
+    let stderr_reader = spawn_output_reader(stderr, deadline);
 
-    let status = wait_for_child(&mut child, COMMAND_TIMEOUT);
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "restart-handoff stdout reader panicked".to_string())?
-        .map_err(|error| format!("failed reading restart-handoff stdout: {error}"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "restart-handoff stderr reader panicked".to_string())?
-        .map_err(|error| format!("failed reading restart-handoff stderr: {error}"))?;
-    drop(stderr);
-    Ok(CommandOutput {
-        status: status?,
-        stdout,
+    let completion = match wait_for_child(&mut child, deadline, timeout) {
+        Ok(completion) => completion,
+        Err(error) => {
+            return Err(command_error_after_cleanup(
+                error,
+                &process_guard,
+                &mut child,
+                &stdout_reader,
+                &stderr_reader,
+                false,
+            ));
+        }
+    };
+    let stdout = match receive_output(&stdout_reader, deadline, "stdout") {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            return Err(command_error_after_cleanup(
+                error,
+                &process_guard,
+                &mut child,
+                &stdout_reader,
+                &stderr_reader,
+                false,
+            ));
+        }
+    };
+    if let Err(error) = receive_output(&stderr_reader, deadline, "stderr") {
+        return Err(command_error_after_cleanup(
+            error,
+            &process_guard,
+            &mut child,
+            &stdout_reader,
+            &stderr_reader,
+            true,
+        ));
+    }
+    let status = finish_child_wait(&mut child, completion)?;
+    Ok(CommandOutput { status, stdout })
+}
+
+impl CommandProcessGuard {
+    fn new() -> Result<Self, String> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::JobObjects::{
+                CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            };
+
+            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if job.is_null() {
+                return Err(format!(
+                    "failed creating restart-handoff process job: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&info).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                )
+            } == 0
+            {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(job);
+                }
+                return Err(format!(
+                    "failed configuring restart-handoff process job: {error}"
+                ));
+            }
+            Ok(Self { job })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    fn configure_command(&self, command: &mut Command) {
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(windows)]
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+        #[cfg(not(any(unix, windows)))]
+        let _ = command;
+    }
+
+    fn assign_and_start(&self, child: &mut Child) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+            if unsafe {
+                AssignProcessToJobObject(
+                    self.job,
+                    child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                )
+            } == 0
+            {
+                let error = std::io::Error::last_os_error();
+                let _ = child.kill();
+                let _ = reap_child_until(child, Instant::now() + CLEANUP_TIMEOUT);
+                return Err(format!(
+                    "failed assigning restart-handoff command to process job: {error}"
+                ));
+            }
+            resume_windows_process(child.id())?;
+        }
+        #[cfg(not(windows))]
+        let _ = child;
+        Ok(())
+    }
+
+    fn terminate(&self, child: &mut Child) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            let process_group = child.id() as libc::pid_t;
+            let mut failures = Vec::new();
+            if let Err(error) = signal_process_group(process_group, libc::SIGTERM) {
+                failures.push(error);
+            }
+            thread::sleep(CLEANUP_TIMEOUT / 2);
+            if let Err(error) = signal_process_group(process_group, libc::SIGKILL) {
+                failures.push(error);
+            }
+            let _ = child.kill();
+            match reap_child_until(child, Instant::now() + CLEANUP_TIMEOUT / 2) {
+                Ok(true) => {}
+                Ok(false) => failures.push(
+                    "restart-handoff command cleanup did not settle before its deadline"
+                        .to_string(),
+                ),
+                Err(error) => failures.push(error),
+            }
+            match wait_for_process_group_exit(process_group, CLEANUP_TIMEOUT / 2) {
+                Ok(true) => {}
+                Ok(false) => failures
+                    .push("restart-handoff descendant cleanup could not be verified".to_string()),
+                Err(error) => failures.push(error),
+            }
+            return if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(failures.join("; "))
+            };
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+            if unsafe { TerminateJobObject(self.job, 1) } == 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = child.kill();
+                let _ = reap_child_until(child, Instant::now() + CLEANUP_TIMEOUT);
+                return Err(format!(
+                    "restart-handoff descendant cleanup could not be verified: {error}"
+                ));
+            }
+            return match reap_child_until(child, Instant::now() + CLEANUP_TIMEOUT) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(
+                    "restart-handoff command cleanup did not settle before its deadline"
+                        .to_string(),
+                ),
+                Err(error) => Err(error),
+            };
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child.kill();
+            let _ = reap_child_until(child, Instant::now() + CLEANUP_TIMEOUT);
+            Err("restart-handoff descendant cleanup could not be verified".to_string())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CommandProcessGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.job);
+        }
+    }
+}
+
+fn spawn_output_reader<R: Read + Send + 'static>(
+    reader: R,
+    deadline: Instant,
+) -> Receiver<std::io::Result<Vec<u8>>> {
+    #[cfg(not(unix))]
+    let _ = deadline;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        #[cfg(unix)]
+        let result = read_bounded_until(reader, deadline);
+        #[cfg(not(unix))]
+        let result = read_bounded(reader);
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+#[cfg(unix)]
+fn set_nonblocking(reader: &impl AsRawFd) -> std::io::Result<()> {
+    let descriptor = reader.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn receive_output(
+    reader: &Receiver<std::io::Result<Vec<u8>>>,
+    deadline: Instant,
+    stream: &str,
+) -> Result<Vec<u8>, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match reader.recv_timeout(remaining) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(format!("failed reading restart-handoff {stream}: {error}")),
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "restart-handoff command output did not settle before its operation deadline ({stream} still open)"
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(format!(
+            "restart-handoff {stream} reader stopped unexpectedly"
+        )),
+    }
+}
+
+fn command_error_after_cleanup(
+    error: String,
+    process_guard: &CommandProcessGuard,
+    child: &mut Child,
+    stdout_reader: &Receiver<std::io::Result<Vec<u8>>>,
+    stderr_reader: &Receiver<std::io::Result<Vec<u8>>>,
+    stdout_already_settled: bool,
+) -> String {
+    let cleanup = process_guard.terminate(child);
+    let settle_deadline = Instant::now() + CLEANUP_TIMEOUT;
+    let stdout_settled =
+        stdout_already_settled || receive_output(stdout_reader, settle_deadline, "stdout").is_ok();
+    let stderr_settled = receive_output(stderr_reader, settle_deadline, "stderr").is_ok();
+    match (cleanup, stdout_settled && stderr_settled) {
+        (Ok(()), true) => format!("{error}; owned process cleanup completed"),
+        (Ok(()), false) => {
+            format!(
+                "{error}; owned process cleanup completed but detached output ownership remained unresolved"
+            )
+        }
+        (Err(cleanup_error), _) => format!("{error}; {cleanup_error}"),
+    }
+}
+
+fn error_with_cleanup(error: String, cleanup: Result<(), String>) -> String {
+    match cleanup {
+        Ok(()) => format!("{error}; owned process cleanup completed"),
+        Err(cleanup_error) => format!("{error}; {cleanup_error}"),
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group: libc::pid_t, signal: libc::c_int) -> Result<(), String> {
+    if unsafe { libc::kill(-process_group, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(format!(
+        "failed signaling restart-handoff process group {process_group}: {error}"
+    ))
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group: libc::pid_t) -> Result<bool, String> {
+    if unsafe { libc::kill(-process_group, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(format!(
+        "failed checking restart-handoff process group {process_group}: {error}"
+    ))
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_exit(
+    process_group: libc::pid_t,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_group_exists(process_group)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(windows)]
+fn resume_windows_process(pid: u32) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        return Err(format!(
+            "failed listing suspended restart-handoff threads: {error}"
+        ));
+    }
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut found = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    let mut resume_result = None;
+    while found {
+        if entry.th32OwnerProcessID == pid {
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if thread.is_null() {
+                resume_result = Some(Err(format!(
+                    "failed opening suspended restart-handoff thread: {}",
+                    std::io::Error::last_os_error()
+                )));
+            } else {
+                let previous_count = unsafe { ResumeThread(thread) };
+                let resume_error = (previous_count == u32::MAX).then(std::io::Error::last_os_error);
+                unsafe {
+                    CloseHandle(thread);
+                }
+                resume_result = Some(match (previous_count, resume_error) {
+                    (1, _) => Ok(()),
+                    (u32::MAX, Some(error)) => Err(format!(
+                        "failed resuming suspended restart-handoff process {pid}: {error}"
+                    )),
+                    (count, _) => Err(format!(
+                        "restart-handoff process {pid} remained suspended after resume (previous count {count})"
+                    )),
+                });
+            }
+            break;
+        }
+        found = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    resume_result.unwrap_or_else(|| {
+        Err(format!(
+            "failed finding suspended restart-handoff process thread for {pid}"
+        ))
     })
 }
 
@@ -326,6 +733,7 @@ fn openclaw_program_arguments(
     }
 }
 
+#[cfg(not(unix))]
 fn read_bounded<R: Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
     let mut kept = Vec::new();
     let mut chunk = [0_u8; 8192];
@@ -340,23 +748,62 @@ fn read_bounded<R: Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
     Ok(kept)
 }
 
-fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {
-    let started_at = Instant::now();
+#[cfg(unix)]
+fn read_bounded_until<R: Read>(mut reader: R, deadline: Instant) -> std::io::Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    let mut chunk = [0_u8; 8192];
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if started_at.elapsed() < timeout => {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "output did not settle before its operation deadline",
+            ));
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(kept),
+            Ok(read) => {
+                let remaining = MAX_OUTPUT_BYTES.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "output did not settle before its operation deadline",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn wait_for_child(
+    child: &mut Child,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<ChildCompletion, String> {
+    loop {
+        #[cfg(unix)]
+        let wait_result = child_exited_unreaped(child).map(|exited| exited.then_some(()));
+        #[cfg(not(unix))]
+        let wait_result = child.try_wait();
+        match wait_result {
+            #[cfg(unix)]
+            Ok(Some(())) => return Ok(ChildCompletion::ExitedUnreaped),
+            #[cfg(not(unix))]
+            Ok(Some(status)) => return Ok(ChildCompletion::Reaped(status)),
+            Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(25));
             }
             Ok(None) => {
-                terminate_child(child);
                 return Err(format!(
                     "restart-handoff command timed out after {} seconds",
                     timeout.as_secs()
                 ));
             }
             Err(error) => {
-                terminate_child(child);
                 return Err(format!(
                     "failed waiting for restart-handoff command: {error}"
                 ));
@@ -365,26 +812,48 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, St
     }
 }
 
-fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let process_group = format!("-{}", child.id());
-        let _ = Command::new("kill")
-            .args(["-TERM", "--", &process_group])
-            .status();
-        for _ in 0..20 {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(Duration::from_millis(25)),
-                Err(_) => break,
+#[cfg(unix)]
+fn child_exited_unreaped(child: &Child) -> Result<bool, String> {
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+fn finish_child_wait(child: &mut Child, completion: ChildCompletion) -> Result<ExitStatus, String> {
+    #[cfg(not(unix))]
+    let _ = child;
+    match completion {
+        #[cfg(unix)]
+        ChildCompletion::ExitedUnreaped => child
+            .try_wait()
+            .map_err(|error| format!("failed reaping restart-handoff command: {error}"))?
+            .ok_or_else(|| "restart-handoff command exit was not ready to reap".to_string()),
+        #[cfg(not(unix))]
+        ChildCompletion::Reaped(status) => Ok(status),
+    }
+}
+
+fn reap_child_until(child: &mut Child, deadline: Instant) -> Result<bool, String> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                return Err(format!("failed reaping restart-handoff command: {error}"));
             }
         }
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &process_group])
-            .status();
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn command_failure_detail(status: ExitStatus) -> String {
@@ -397,6 +866,12 @@ fn command_failure_detail(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
@@ -542,5 +1017,130 @@ mod tests {
         for key in OPENCLAW_NATIVE_SERVICE_IDENTITY_KEYS {
             assert!(!prepared.process_env.contains_key(key));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_command_bounds_output_settlement_and_cleans_pipe_holders() {
+        let temp = tempfile::tempdir().unwrap();
+        let descendant_pid = temp.path().join("descendant.pid");
+        let launcher = temp.path().join("openclaw.mjs");
+        fs::write(
+            &launcher,
+            "#!/bin/sh\n( trap '' TERM HUP; for _ in 1 2 3 4 5; do sleep 1; done ) &\nprintf '%s\\n' \"$!\" > \"$OCM_TEST_DESCENDANT_PID\"\nprintf '%s\\n' '{\"ok\":true}'\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut spec = direct_spec();
+        spec.binary_path = Some(launcher.to_string_lossy().into_owned());
+        spec.run_dir = temp.path().to_string_lossy().into_owned();
+        spec.process_env.insert(
+            "OCM_TEST_DESCENDANT_PID".to_string(),
+            descendant_pid.to_string_lossy().into_owned(),
+        );
+        let started_at = Instant::now();
+        let error = match run_openclaw_machine_command_with_timeout(
+            &spec,
+            &["gateway", "restart-handoff", "capabilities", "--json"],
+            Duration::from_millis(250),
+        ) {
+            Ok(_) => panic!("command unexpectedly settled inherited output"),
+            Err(error) => error,
+        };
+        assert!(
+            started_at.elapsed() < Duration::from_secs(3),
+            "output settlement exceeded the bounded operation deadline"
+        );
+        assert!(error.contains("output did not settle"), "{error}");
+
+        let descendant_pid = fs::read_to_string(descendant_pid).unwrap();
+        for _ in 0..100 {
+            let alive = Command::new("kill")
+                .args(["-0", descendant_pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("output-holding descendant survived command cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_command_bounds_output_from_detached_pipe_holders() {
+        let temp = tempfile::tempdir().unwrap();
+        let descendant_pid = temp.path().join("detached-descendant.pid");
+        let launcher = temp.path().join("openclaw.mjs");
+        fs::write(
+            &launcher,
+            "#!/bin/sh\n\"$OCM_TEST_HELPER_BIN\" --exact supervisor::openclaw_handoff::tests::detached_output_holder_helper --nocapture &\nfor _ in $(seq 1 200); do\n  [ -f \"$OCM_TEST_DESCENDANT_PID\" ] && break\n  sleep 0.01\ndone\nprintf '%s\\n' '{\"ok\":true}'\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut spec = direct_spec();
+        spec.binary_path = Some(launcher.to_string_lossy().into_owned());
+        spec.run_dir = temp.path().to_string_lossy().into_owned();
+        spec.process_env.insert(
+            "OCM_TEST_HELPER_BIN".to_string(),
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        spec.process_env.insert(
+            "OCM_TEST_DESCENDANT_PID".to_string(),
+            descendant_pid.to_string_lossy().into_owned(),
+        );
+        spec.process_env
+            .insert("OCM_TEST_CONTINUOUS_OUTPUT".to_string(), "1".to_string());
+
+        let started_at = Instant::now();
+        let error = match run_openclaw_machine_command_with_timeout(
+            &spec,
+            &["gateway", "restart-handoff", "capabilities", "--json"],
+            Duration::from_millis(250),
+        ) {
+            Ok(_) => panic!("detached inherited output unexpectedly settled"),
+            Err(error) => error,
+        };
+        assert!(
+            started_at.elapsed() < Duration::from_secs(3),
+            "detached output holder exceeded the bounded operation deadline"
+        );
+        assert!(error.contains("output did not settle"), "{error}");
+        assert!(
+            error.contains("detached output ownership remained unresolved")
+                || error.contains("failed signaling restart-handoff process group"),
+            "{error}"
+        );
+
+        let descendant_pid = fs::read_to_string(descendant_pid).unwrap();
+        let descendant_pid = descendant_pid.trim().parse::<libc::pid_t>().unwrap();
+        assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+        assert_eq!(unsafe { libc::kill(descendant_pid, libc::SIGKILL) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_output_holder_helper() {
+        let Some(pid_path) = std::env::var_os("OCM_TEST_DESCENDANT_PID") else {
+            return;
+        };
+        assert_ne!(unsafe { libc::setsid() }, -1);
+        fs::write(pid_path, std::process::id().to_string()).unwrap();
+        if std::env::var_os("OCM_TEST_CONTINUOUS_OUTPUT").is_some() {
+            let mut stdout = std::io::stdout().lock();
+            let output = [b'x'; 8192];
+            loop {
+                let _ = stdout.write_all(&output);
+            }
+        }
+        thread::sleep(Duration::from_secs(5));
     }
 }

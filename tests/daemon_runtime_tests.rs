@@ -3365,6 +3365,13 @@ struct InactiveGatewayFixture {
     sibling: Value,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConsumeBlock {
+    None,
+    DirectHelper,
+    InheritedOutput,
+}
+
 impl Drop for InactiveGatewayFixture {
     fn drop(&mut self) {
         let _ = fs::write(self.root.child("release-consume"), "release");
@@ -3374,12 +3381,12 @@ impl Drop for InactiveGatewayFixture {
 
 impl InactiveGatewayFixture {
     fn new() -> Self {
-        let fixture = Self::running(false);
+        let fixture = Self::running(ConsumeBlock::None);
         fixture.exit_target();
         fixture
     }
 
-    fn running(block_consume: bool) -> Self {
+    fn running(consume_block: ConsumeBlock) -> Self {
         let root = TestDir::new("inactive-gateway-reconcile");
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
@@ -3395,13 +3402,10 @@ impl InactiveGatewayFixture {
                 &root.child(format!("{name}-stopped")),
                 false,
             );
-            if name == "target" && block_consume {
-                let protocol = format!(
-                    r#"if [ "${{3:-}}" = "capabilities" ]; then
-  printf '%s\n' '{{"ok":true,"protocol":"openclaw.gateway.restart-handoff","protocolVersion":1,"operations":["consume"]}}'
-  exit 0
-fi
-printf 'waiting\n' > '{}'
+            if name == "target" && consume_block != ConsumeBlock::None {
+                let blocked_consume = match consume_block {
+                    ConsumeBlock::DirectHelper => format!(
+                        r#"printf 'waiting\n' > '{}'
 for attempt in $(seq 1 200); do
   if [ -f '{}' ]; then
     printf '%s\n' '{{"ok":true,"protocol":"openclaw.gateway.restart-handoff","protocolVersion":1,"status":"none","reason":"missing"}}'
@@ -3410,8 +3414,30 @@ for attempt in $(seq 1 200); do
   sleep 0.025
 done
 exit 65"#,
-                    path_string(&root.child("consume-waiting")),
-                    path_string(&root.child("release-consume")),
+                        path_string(&root.child("consume-waiting")),
+                        path_string(&root.child("release-consume")),
+                    ),
+                    ConsumeBlock::InheritedOutput => format!(
+                        r#"printf 'waiting\n' > '{}'
+(
+  trap '' TERM HUP
+  while [ ! -f '{}' ]; do sleep 0.025; done
+) &
+printf '%s\n' "$!" > '{}'
+printf '%s\n' '{{"ok":true,"protocol":"openclaw.gateway.restart-handoff","protocolVersion":1,"status":"none","reason":"missing"}}'
+exit 0"#,
+                        path_string(&root.child("consume-waiting")),
+                        path_string(&root.child("release-consume")),
+                        path_string(&root.child("output-holder.pid")),
+                    ),
+                    ConsumeBlock::None => unreachable!(),
+                };
+                let protocol = format!(
+                    r#"if [ "${{3:-}}" = "capabilities" ]; then
+  printf '%s\n' '{{"ok":true,"protocol":"openclaw.gateway.restart-handoff","protocolVersion":1,"operations":["consume"]}}'
+  exit 0
+fi
+{blocked_consume}"#,
                 );
                 let script = fs::read_to_string(&runtime)
                     .unwrap()
@@ -3602,7 +3628,7 @@ fn inactive_exit_decision_is_retired_after_concurrent_stop() {
 
 fn assert_inactive_exit_reconciliation(remove_target: bool) {
     let _guard = daemon_runtime_test_lock();
-    let fixture = InactiveGatewayFixture::running(true);
+    let fixture = InactiveGatewayFixture::running(ConsumeBlock::DirectHelper);
     fixture.signal_target();
     assert!(wait_for_file(
         &fixture.root.child("consume-waiting"),
@@ -3679,6 +3705,59 @@ fn assert_inactive_exit_reconciliation(remove_target: bool) {
             .lines()
             .count(),
         1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn inherited_handoff_output_does_not_block_sibling_stop() {
+    let _guard = daemon_runtime_test_lock();
+    let fixture = InactiveGatewayFixture::running(ConsumeBlock::InheritedOutput);
+    fixture.signal_target();
+    assert!(wait_for_file(
+        &fixture.root.child("consume-waiting"),
+        Duration::from_secs(5)
+    ));
+    assert!(wait_for_file(
+        &fixture.root.child("output-holder.pid"),
+        Duration::from_secs(5)
+    ));
+
+    let started_at = Instant::now();
+    let stopped = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["service", "stop", "sibling", "--json"],
+    );
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let runtime = read_persisted_service_state(&fixture.runtime_path);
+        let sibling = runtime["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["envName"] == "sibling");
+        if sibling.is_none_or(|entry| entry["gatewayState"] == "stopped" && entry["pid"].is_null())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "inherited helper output kept the sibling running"
+        );
+        sleep(Duration::from_millis(25));
+    }
+    assert!(
+        started_at.elapsed() < Duration::from_secs(20),
+        "sibling stop exceeded the bounded helper operation"
+    );
+
+    let output_holder = fs::read_to_string(fixture.root.child("output-holder.pid")).unwrap();
+    assert!(
+        !process_exists(output_holder.trim().parse().unwrap()),
+        "output-holding descendant survived helper cleanup"
     );
 }
 
