@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -142,12 +141,6 @@ def wait_until(predicate, description, timeout=8):
     raise AssertionError("timed out waiting for " + description)
 
 
-def available_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def scenario(ocm, case, mode):
     script = Path(__file__).resolve()
     cwd = case / "workspace"
@@ -203,17 +196,13 @@ def scenario(ocm, case, mode):
         return next((row for row in runtime().get("children", []) if row["envName"] == name), None)
 
     try:
-        ports = set()
         for name in ["sibling", "target"]:
             launcher_cwd = cwd / name
             launcher_cwd.mkdir()
             command = shlex.join(["exec", sys.executable, str(script), "peer", str(case), name])
             run("launcher", "add", name, "--command", command, "--cwd", str(launcher_cwd))
-            port = available_port()
-            while port in ports:
-                port = available_port()
-            ports.add(port)
-            run("env", "create", name, "--launcher", name, "--port", str(port))
+            # Reuse the complete-family allocator and registered-peer exclusion.
+            run("env", "create", name, "--launcher", name)
             marker = home / "envs" / name / ".openclaw/workspace/generation.txt"
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("snapshot" if name == "target" else "sibling")

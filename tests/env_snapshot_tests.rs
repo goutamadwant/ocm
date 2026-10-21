@@ -40,6 +40,12 @@ fn install_fake_launchctl(root: &TestDir, env: &mut std::collections::BTreeMap<S
 
 #[cfg(target_os = "linux")]
 fn assert_live_snapshot_compensation(mode: &str) {
+    // Isolated registries otherwise select the same default families before
+    // their peers start. Keep each live scenario's ports through teardown.
+    static LIVE_SNAPSHOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LIVE_SNAPSHOT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let root = TestDir::new("snapshot-live-compensation");
     let mut env = ocm_env(&root);
     env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
