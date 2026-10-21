@@ -482,6 +482,53 @@ maintenance. This protects the caller from the supervisor's signals to that
 group. A systemd unit stop or restart can still terminate the caller through its
 service cgroup.
 
+### Supervisor bootstrap logs on a separate filesystem
+
+By default, the supervisor's own stdout/stderr logs live under
+`$OCM_HOME/supervisor/logs`. If the OS service manager cannot open logs there
+(for example, on an affected macOS external volume), select a dedicated,
+absolute directory on an accessible filesystem when installing the service:
+
+```bash
+OCM_DAEMON_LOG_DIR="$HOME/Library/Logs/OCM" ocm service install mira
+```
+
+OCM saves the selected directory in
+`$OCM_HOME/supervisor/daemon-log-config.json`. Later status, lifecycle and
+upgrade commands reuse it without requiring the variable. The service definition
+contains the resolved paths, so startup does not depend on a terminal's
+configuration. Each store remembers its own choice; the OS user still has one
+shared OCM service registration, and the existing store-ownership checks apply.
+
+For an already-installed service, apply or change the selection during a
+maintenance window:
+
+```bash
+OCM_DAEMON_LOG_DIR="$HOME/Library/Logs/OCM" \
+  ocm service refresh-daemon --acknowledge-gateway-restarts
+```
+
+The variable selects a destination for service definition generation. Status
+commands report the saved choice without changing it. OCM retains the selection
+if service activation fails after the definition was written, allowing a later
+retry without the variable; a definition-write failure restores the previous
+selection. To return to the default, refresh with the store's default log path;
+OCM removes the saved override:
+
+```bash
+OCM_DAEMON_LOG_DIR="${OCM_HOME:-$HOME/.ocm}/supervisor/logs" \
+  ocm service refresh-daemon --acknowledge-gateway-restarts
+```
+
+Only `daemon.stdout.log` and `daemon.stderr.log` use this directory. Environment
+data, runtimes, workspaces, gateway logs and the supervisor working directory
+stay under their existing paths. Existing log files are not moved or deleted.
+OCM creates the log directory using its normal private-directory permissions;
+choose a dedicated directory, not a shared one. Empty and relative paths fail.
+
+This does not grant macOS privacy permissions or make an unmounted store
+available. The store and executable must still be accessible at startup.
+
 ### Read logs
 
 ```bash

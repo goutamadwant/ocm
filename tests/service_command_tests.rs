@@ -2133,6 +2133,47 @@ fn service_status_version_contract_is_read_only_for_mismatch_unknown_and_current
 }
 
 #[test]
+fn daemon_log_directory_survives_a_fresh_cli_and_service_refresh() {
+    for systemd in [false, true] {
+        let root = TestDir::new("daemon-log-directory");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = if systemd {
+            systemd_env(&root)
+        } else {
+            launchd_env(&root)
+        };
+        setup_launcher_env(&cwd, &env);
+        let logs = root.child("internal-logs");
+        env.insert("OCM_DAEMON_LOG_DIR".into(), path_string(&logs));
+        let installed = run_ocm(&cwd, &env, &["service", "install", "demo", "--json"]);
+        assert!(installed.status.success(), "{}", stderr(&installed));
+        env.remove("OCM_DAEMON_LOG_DIR");
+        let definition = managed_service_definition_path(&env, &cwd, "ocm");
+        let before = fs::read(&definition).unwrap();
+        let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let refreshed = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "service",
+                "refresh-daemon",
+                "--acknowledge-gateway-restarts",
+                "--json",
+            ],
+        );
+        assert!(refreshed.status.success(), "{}", stderr(&refreshed));
+        assert_eq!(
+            json_output(&refreshed)["stdoutPath"],
+            path_string(&logs.join("daemon.stdout.log"))
+        );
+        assert_eq!(fs::read(&definition).unwrap(), before);
+        assert!(logs.is_dir());
+    }
+}
+
+#[test]
 fn service_refresh_daemon_requires_interruption_ack_and_preserves_desired_state() {
     let root = TestDir::new("service-refresh-daemon-ack");
     let cwd = root.child("workspace");

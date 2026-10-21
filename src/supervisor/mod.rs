@@ -83,6 +83,13 @@ const SUPERVISED_CHILD_BASE_ENV_KEYS: [&str; 5] = ["HOME", "PATH", "OCM_HOME", "
 const SUPERVISED_CHILD_RUNTIME_ENV_KEYS: [&str; 4] =
     ["NODE_OPTIONS", "NODE_ENV", "NODE_PATH", "PNPM_HOME"];
 const SERVICE_EXECUTABLE_OVERRIDE: &str = "OCM_SERVICE_EXECUTABLE";
+const DAEMON_LOG_DIR_OVERRIDE: &str = "OCM_DAEMON_LOG_DIR";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DaemonLogConfig {
+    log_dir: PathBuf,
+}
 pub(crate) const SERVICE_EXECUTABLE_IDENTITY: &str = "ocm-service-supervisor";
 const SERVICE_EXECUTABLE_IDENTITY_TIMEOUT_MS: u64 = 1_000;
 const SERVICE_EXECUTABLE_IDENTITY_BUSY_ATTEMPTS: usize = 5;
@@ -795,10 +802,12 @@ impl<'a> SupervisorService<'a> {
         if before.installed {
             self.require_durable_daemon_executable()?;
         }
-        let definition = self.supervisor_daemon_definition()?;
+        let mut definition = self.supervisor_daemon_definition()?;
+        definition.stdout_path = PathBuf::from(&before.stdout_path);
+        definition.stderr_path = PathBuf::from(&before.stderr_path);
         deactivate_managed_service(&definition, self.env)?;
         if before.installed {
-            write_managed_service_definition(&definition, self.env)?;
+            self.write_daemon_definition(&definition)?;
             if before.loaded {
                 restore_managed_service_registration(
                     &definition.label,
@@ -1088,7 +1097,7 @@ impl<'a> SupervisorService<'a> {
         let definition = self.supervisor_daemon_definition()?;
         // An attempted write or activation can leave partial effects even on error.
         *daemon_mutation_attempted = true;
-        write_managed_service_definition(&definition, self.env)?;
+        self.write_daemon_definition(&definition)?;
         activate_managed_service(&definition.label, &definition.definition_path, self.env)?;
         self.daemon_summary(action, false)
     }
@@ -1128,7 +1137,7 @@ impl<'a> SupervisorService<'a> {
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let state_path = supervisor_state_path(self.env, self.cwd)?;
         let identity = managed_service_identity(self.env, self.cwd)?;
-        let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
+        let logs_dir = self.saved_daemon_logs_dir()?;
         let stdout_path = logs_dir.join("daemon.stdout.log");
         let stderr_path = logs_dir.join("daemon.stderr.log");
         let status = inspect(&identity.label, &identity.definition_path, self.env)?;
@@ -1161,7 +1170,7 @@ impl<'a> SupervisorService<'a> {
     fn supervisor_daemon_definition(&self) -> Result<ManagedServiceDefinition, String> {
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let identity = managed_service_identity(self.env, self.cwd)?;
-        let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
+        let logs_dir = self.daemon_logs_dir()?;
         let executable_path = self.supervisor_executable_path()?;
 
         Ok(ManagedServiceDefinition {
@@ -1181,6 +1190,102 @@ impl<'a> SupervisorService<'a> {
             stderr_path: logs_dir.join("daemon.stderr.log"),
             environment: supervisor_service_environment(self.env, &ocm_home, &executable_path),
         })
+    }
+
+    fn daemon_log_config_path(&self) -> Result<PathBuf, String> {
+        Ok(resolve_ocm_home(self.env, self.cwd)?
+            .join("supervisor")
+            .join("daemon-log-config.json"))
+    }
+
+    fn daemon_log_config(&self) -> Result<Option<DaemonLogConfig>, String> {
+        let path = self.daemon_log_config_path()?;
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("failed inspecting {}: {error}", path.display())),
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(format!("{} must be a regular file", path.display()));
+            }
+            Ok(_) => {}
+        }
+        let config: DaemonLogConfig = read_json(&path).map_err(|error| {
+            format!(
+                "invalid daemon log configuration at {}: {error}",
+                path.display()
+            )
+        })?;
+        if !config.log_dir.is_absolute() {
+            return Err(format!(
+                "daemon log directory in {} must be absolute",
+                path.display()
+            ));
+        }
+        Ok(Some(config))
+    }
+
+    fn saved_daemon_logs_dir(&self) -> Result<PathBuf, String> {
+        match self.daemon_log_config()? {
+            Some(config) => Ok(config.log_dir),
+            None => supervisor_logs_dir(self.env, self.cwd),
+        }
+    }
+
+    fn daemon_logs_dir(&self) -> Result<PathBuf, String> {
+        // Validate saved data even when selecting a replacement, so an older
+        // binary cannot silently overwrite an unknown configuration format.
+        let saved = self.saved_daemon_logs_dir()?;
+        match self.env.get(DAEMON_LOG_DIR_OVERRIDE) {
+            Some(value) => {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err(format!(
+                        "{DAEMON_LOG_DIR_OVERRIDE} must be an absolute directory path"
+                    ));
+                }
+                Ok(path)
+            }
+            None => Ok(saved),
+        }
+    }
+
+    fn save_daemon_log_config(&self, config: Option<&DaemonLogConfig>) -> Result<(), String> {
+        let path = self.daemon_log_config_path()?;
+        if let Some(config) = config {
+            write_json(&path, config)
+        } else {
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("failed removing {}: {error}", path.display())),
+            }
+        }
+    }
+
+    // All callers hold the daemon lifecycle lock. Save before publishing the
+    // definition, and restore the previous selection if publication fails.
+    fn write_daemon_definition(&self, definition: &ManagedServiceDefinition) -> Result<(), String> {
+        validate_managed_service_owner(definition, self.env)?;
+        let previous = self.daemon_log_config()?;
+        let logs = definition
+            .stdout_path
+            .parent()
+            .ok_or("daemon stdout path has no parent")?;
+        let next = (logs != supervisor_logs_dir(self.env, self.cwd)?).then(|| DaemonLogConfig {
+            log_dir: logs.to_path_buf(),
+        });
+        if previous == next {
+            return write_managed_service_definition(definition, self.env);
+        }
+        self.save_daemon_log_config(next.as_ref())?;
+        if let Err(error) = write_managed_service_definition(definition, self.env) {
+            return match self.save_daemon_log_config(previous.as_ref()) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(format!(
+                    "{error}; failed restoring daemon log configuration: {rollback}"
+                )),
+            };
+        }
+        Ok(())
     }
 
     fn supervisor_executable_path(&self) -> Result<PathBuf, String> {
@@ -4000,6 +4105,132 @@ mod tests {
             let mut permissions = fs::metadata(path).unwrap().permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    #[test]
+    fn daemon_bootstrap_log_override_preserves_store_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let store = root.path().join("external-store");
+        let logs = root.path().join("internal-logs");
+        let mut env = BTreeMap::from([
+            ("HOME".to_string(), display_path(&home)),
+            ("OCM_HOME".to_string(), display_path(&store)),
+            ("OCM_DAEMON_LOG_DIR".to_string(), display_path(&logs)),
+            (
+                "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+                "launchd".to_string(),
+            ),
+        ]);
+        let service = super::SupervisorService::new(&env, root.path());
+        let definition = service.supervisor_daemon_definition().unwrap();
+        assert_eq!(definition.stdout_path, logs.join("daemon.stdout.log"));
+        assert_eq!(definition.stderr_path, logs.join("daemon.stderr.log"));
+        assert_eq!(definition.working_directory, store);
+        assert_eq!(
+            super::supervisor_logs_dir(&env, root.path()).unwrap(),
+            store.join("supervisor/logs")
+        );
+        assert!(!definition.environment.contains_key("OCM_DAEMON_LOG_DIR"));
+        let _lock = service.lock_daemon_lifecycle().unwrap();
+        service.write_daemon_definition(&definition).unwrap();
+        let summary = service.daemon_status().unwrap();
+        assert_eq!(summary.stdout_path, display_path(&definition.stdout_path));
+        assert_eq!(summary.stderr_path, display_path(&definition.stderr_path));
+        service.write_daemon_definition(&definition).unwrap();
+        assert!(logs.is_dir());
+        let again = service.supervisor_daemon_definition().unwrap();
+        service.write_daemon_definition(&again).unwrap();
+        assert_eq!(again.stdout_path, definition.stdout_path);
+
+        env.remove("OCM_DAEMON_LOG_DIR");
+        let persisted = super::SupervisorService::new(&env, root.path())
+            .supervisor_daemon_definition()
+            .unwrap();
+        assert_eq!(persisted.stdout_path, definition.stdout_path);
+        env.insert(
+            "OCM_DAEMON_LOG_DIR".into(),
+            display_path(&store.join("supervisor/logs")),
+        );
+        let default = super::SupervisorService::new(&env, root.path())
+            .supervisor_daemon_definition()
+            .unwrap();
+        assert_eq!(
+            default.stdout_path,
+            store.join("supervisor/logs/daemon.stdout.log")
+        );
+        super::SupervisorService::new(&env, root.path())
+            .write_daemon_definition(&default)
+            .unwrap();
+        assert!(!store.join("supervisor/daemon-log-config.json").exists());
+        for invalid in ["", "relative/logs"] {
+            env.insert("OCM_DAEMON_LOG_DIR".to_string(), invalid.to_string());
+            assert!(
+                super::SupervisorService::new(&env, root.path())
+                    .supervisor_daemon_definition()
+                    .unwrap_err()
+                    .contains("absolute")
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_log_configuration_failure_preserves_the_previous_choice() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store");
+        let mut env = BTreeMap::from([
+            ("HOME".into(), display_path(&root.path().join("home"))),
+            ("OCM_HOME".into(), display_path(&store)),
+            ("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into()),
+        ]);
+        let first = root.path().join("first-logs");
+        env.insert("OCM_DAEMON_LOG_DIR".into(), display_path(&first));
+        let service = super::SupervisorService::new(&env, root.path());
+        let _lock = service.lock_daemon_lifecycle().unwrap();
+        let definition = service.supervisor_daemon_definition().unwrap();
+        service.write_daemon_definition(&definition).unwrap();
+        let config_path = store.join("supervisor/daemon-log-config.json");
+        let config_before = std::fs::read(&config_path).unwrap();
+        let definition_before = std::fs::read(&definition.definition_path).unwrap();
+
+        let blocked = root.path().join("not-a-directory");
+        std::fs::write(&blocked, "preserve").unwrap();
+        env.insert("OCM_DAEMON_LOG_DIR".into(), display_path(&blocked));
+        let service = super::SupervisorService::new(&env, root.path());
+        let replacement = service.supervisor_daemon_definition().unwrap();
+        assert!(service.write_daemon_definition(&replacement).is_err());
+        assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+        assert_eq!(
+            std::fs::read(&definition.definition_path).unwrap(),
+            definition_before
+        );
+        assert_eq!(
+            service.daemon_status().unwrap().stdout_path,
+            display_path(&first.join("daemon.stdout.log"))
+        );
+        assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "preserve");
+
+        env.remove("OCM_DAEMON_LOG_DIR");
+        env.insert(
+            "OCM_HOME".into(),
+            display_path(&root.path().join("other-store")),
+        );
+        let other = super::SupervisorService::new(&env, root.path());
+        assert_eq!(
+            other.saved_daemon_logs_dir().unwrap(),
+            root.path().join("other-store/supervisor/logs")
+        );
+        env.insert("OCM_HOME".into(), display_path(&store));
+        let service = super::SupervisorService::new(&env, root.path());
+        for invalid in [
+            "{",
+            r#"{"logDir":"relative"}"#,
+            r#"{"logDir":"/valid","unknown":true}"#,
+        ] {
+            std::fs::write(&config_path, invalid).unwrap();
+            assert!(service.supervisor_daemon_definition().is_err());
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), invalid);
         }
     }
 

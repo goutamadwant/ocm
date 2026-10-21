@@ -2342,6 +2342,7 @@ pub fn service_command_help(cmd: &str, action: &str) -> Option<String> {
             &[
                 "Use `service start` to start the env after it is enabled.",
                 "The shared OCM background service is installed automatically when needed.",
+                "Set OCM_DAEMON_LOG_DIR to a dedicated absolute directory when installing to save this store's supervisor log location. For an existing service, use refresh-daemon during a maintenance window.",
             ],
         ),
         "status" => render_leaf(
@@ -2470,8 +2471,10 @@ pub fn service_command_help(cmd: &str, action: &str) -> Option<String> {
                 "{cmd} service refresh-daemon --acknowledge-gateway-restarts"
             )],
             &[
-                "Run this only in a maintenance window when service status reports a CLI/daemon version mismatch.",
+                "Run this in a maintenance window to update an older daemon or change its supervisor log directory.",
                 "The command never rebuilds desired state before restarting the daemon.",
+                "Set OCM_DAEMON_LOG_DIR to a dedicated absolute directory to save this store's supervisor stdout/stderr location. Later commands reuse it without the variable.",
+                "To restore default log placement, set OCM_DAEMON_LOG_DIR to the store's supervisor/logs directory while refreshing. Gateway logs stay unchanged.",
             ],
         ),
         "uninstall" => render_leaf(
