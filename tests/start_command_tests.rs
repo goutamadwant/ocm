@@ -427,6 +427,257 @@ fn start_reuses_existing_env_without_forcing_onboarding() {
 }
 
 #[test]
+fn start_preserves_included_settings_and_exported_workspace() {
+    for shape in ["root-include", "inline", "root-siblings"] {
+        let root = TestDir::new(shape);
+        let cwd = root.child("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        for args in [
+            vec!["launcher", "add", "stable", "--command", "openclaw"],
+            vec!["env", "create", "demo", "--launcher", "stable"],
+        ] {
+            let output = run_ocm(&cwd, &env, &args);
+            assert!(output.status.success(), "{}", stderr(&output));
+        }
+        let state = root.child("ocm-home/envs/demo/.openclaw");
+        let workspace = state.join("team/authored");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("notes.txt"), "authored workspace").unwrap();
+        let authored = serde_json::json!({
+            "gateway": {"mode": "local", "bind": "lan", "port": 28431},
+            "agents": {"defaults": {"workspace": path_string(&workspace)}}
+        });
+        let included = serde_json::to_vec(&authored).unwrap();
+        fs::write(state.join("base.json"), &included).unwrap();
+        let config = match shape {
+            "root-include" => serde_json::json!({"$include": "./base.json"}),
+            "inline" => authored.clone(),
+            _ => serde_json::json!({
+                "$include": "./base.json",
+                "gateway": {"bind": "loopback"},
+                "agents": {"defaults": {"workspace": path_string(&workspace)}}
+            }),
+        };
+        let config_path = state.join("openclaw.json");
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        for phase in ["before", "after"] {
+            if phase == "after" {
+                let start = run_ocm(&cwd, &env, &["start", "demo", "--no-service", "--json"]);
+                assert!(start.status.success(), "{}", stderr(&start));
+                let summary: Value = serde_json::from_str(&stdout(&start)).unwrap();
+                assert_eq!(summary["gatewayPort"], 28431);
+                assert_eq!(summary["serviceStarted"], false);
+            }
+            let archive_path = root.child(format!("{phase}.tar"));
+            let export = run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "env",
+                    "export",
+                    "demo",
+                    "--output",
+                    &path_string(&archive_path),
+                ],
+            );
+            assert!(export.status.success(), "{}", stderr(&export));
+            let mut archive = tar::Archive::new(fs::File::open(archive_path).unwrap());
+            assert!(
+                archive.entries().unwrap().any(|entry| {
+                    entry.unwrap().path().unwrap()
+                        == std::path::Path::new("root/.openclaw/team/authored/notes.txt")
+                }),
+                "{shape} {phase} lost authored workspace from export"
+            );
+        }
+        let raw: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        if shape == "root-include" {
+            assert_eq!(raw["$include"], "./base.json");
+            assert!(raw["gateway"].get("bind").is_none());
+            assert!(raw.get("agents").is_none());
+        } else {
+            assert_eq!(
+                raw["gateway"]["bind"],
+                if shape == "inline" { "lan" } else { "loopback" }
+            );
+            assert_eq!(
+                raw["agents"]["defaults"]["workspace"],
+                path_string(&workspace)
+            );
+        }
+        assert_eq!(fs::read(state.join("base.json")).unwrap(), included);
+        assert_eq!(
+            fs::read_to_string(workspace.join("notes.txt")).unwrap(),
+            "authored workspace"
+        );
+        let once = fs::read(&config_path).unwrap();
+        let repeat = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
+        assert!(repeat.status.success(), "{}", stderr(&repeat));
+        assert_eq!(fs::read(&config_path).unwrap(), once);
+    }
+}
+
+#[test]
+fn start_minimum_setup_does_not_traverse_unrelated_external_includes() {
+    for shape in ["complete-agents", "missing-bind", "internal-root"] {
+        let root = TestDir::new(shape);
+        let cwd = root.child("cwd");
+        let shared = root.child("shared");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        let mut env = ocm_env(&root);
+        env.insert("OPENCLAW_INCLUDE_ROOTS".to_string(), path_string(&shared));
+        for args in [
+            vec!["launcher", "add", "stable", "--command", "openclaw"],
+            vec![
+                "env",
+                "create",
+                "demo",
+                "--launcher",
+                "stable",
+                "--port",
+                "28431",
+            ],
+        ] {
+            let result = run_ocm(&cwd, &env, &args);
+            assert!(result.status.success(), "{}", stderr(&result));
+        }
+        let state = root.child("ocm-home/envs/demo/.openclaw");
+        let workspace = state.join("team");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("marker"), "authored data").unwrap();
+        let external = shared.join("settings.json5");
+        let payload = if shape == "complete-agents" {
+            "{list:[{id:'main'}]}\n"
+        } else {
+            "{providers:{}}\n"
+        };
+        fs::write(&external, payload).unwrap();
+        let mut authored = serde_json::json!({
+            "gateway": {"mode": "local", "bind": "lan", "port": 28431},
+            "agents": {"defaults": {"workspace": path_string(&workspace)}}
+        });
+        if shape == "complete-agents" {
+            authored["agents"]["$include"] = serde_json::json!(path_string(&external));
+        } else {
+            authored["models"] = serde_json::json!({"$include": path_string(&external)});
+        }
+        if shape == "missing-bind" {
+            authored["gateway"].as_object_mut().unwrap().remove("bind");
+        }
+        let included = serde_json::to_vec(&authored).unwrap();
+        let config = if shape == "internal-root" {
+            fs::write(state.join("base.json"), &included).unwrap();
+            serde_json::json!({"$include": "./base.json"})
+        } else {
+            authored
+        };
+        let config_path = state.join("openclaw.json");
+        let original = serde_json::to_vec(&config).unwrap();
+        fs::write(&config_path, &original).unwrap();
+        let start = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
+        assert!(start.status.success(), "{shape}: {}", stderr(&start));
+        let raw: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        match shape {
+            "complete-agents" => assert_eq!(fs::read(&config_path).unwrap(), original),
+            "missing-bind" => assert_eq!(raw["gateway"]["bind"], "loopback"),
+            _ => {
+                assert_eq!(raw["$include"], "./base.json");
+                assert!(raw["gateway"].get("bind").is_none());
+                assert!(raw.get("agents").is_none());
+                assert_eq!(fs::read(state.join("base.json")).unwrap(), included);
+            }
+        }
+        assert_eq!(fs::read_to_string(external).unwrap(), payload);
+        assert_eq!(
+            fs::read_to_string(workspace.join("marker")).unwrap(),
+            "authored data"
+        );
+    }
+}
+
+#[test]
+fn start_uses_admitted_launcher_include_roots_and_refuses_unknown_required_settings() {
+    let root = TestDir::new("start-admitted-includes");
+    let cwd = root.child("cwd");
+    let launcher_cwd = root.child("launcher");
+    let shared = launcher_cwd.join("shared");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&shared).unwrap();
+    let mut env = ocm_env(&root);
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "stable",
+            "--command",
+            "openclaw",
+            "--cwd",
+            &path_string(&launcher_cwd),
+        ],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "demo",
+            "--launcher",
+            "stable",
+            "--port",
+            "28431",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let state = root.child("ocm-home/envs/demo/.openclaw");
+    let include = shared.join("config.json5");
+    let contents = serde_json::json!({"gateway":{"mode":"local","bind":"lan","port":28432},"agents":{"defaults":{"workspace":path_string(&state.join("custom"))}}}).to_string();
+    fs::write(&include, &contents).unwrap();
+    let config_path = state.join("openclaw.json");
+    let original = serde_json::json!({"$include":path_string(&include),"env":{"OPENCLAW_INCLUDE_ROOTS":path_string(&shared)}}).to_string();
+    fs::write(&config_path, &original).unwrap();
+    let refused = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("outside the admitted configuration roots"));
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    let changed = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "demo",
+            "--command",
+            "different-openclaw",
+            "--no-service",
+        ],
+    );
+    assert!(!changed.status.success());
+    let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&shown)).unwrap()["defaultLauncher"],
+        "stable"
+    );
+    env.insert("OPENCLAW_INCLUDE_ROOTS".into(), "shared".into());
+    let started = run_ocm(&cwd, &env, &["start", "demo", "--no-service", "--json"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    let summary: Value = serde_json::from_str(&stdout(&started)).unwrap();
+    assert_eq!(summary["gatewayPort"], 28431);
+    let raw: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(raw["gateway"], serde_json::json!({"port":28431}));
+    assert!(raw.get("agents").is_none());
+    assert_eq!(fs::read_to_string(&include).unwrap(), contents);
+    let once = fs::read(&config_path).unwrap();
+    let repeated = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
+    assert!(repeated.status.success(), "{}", stderr(&repeated));
+    assert_eq!(fs::read(&config_path).unwrap(), once);
+}
+
+#[test]
 fn start_rejects_json_when_onboarding_would_run() {
     let root = TestDir::new("start-json-onboarding");
     let cwd = root.child("workspace");
