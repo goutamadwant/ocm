@@ -506,6 +506,36 @@ ocm service status mira
 
 Use `service install` when you want a background service for an environment that was created with `--no-service`, or when you want to bring an older env under background management later.
 
+Service readiness requests `/health` on the local Gateway port using the
+configured transport. Readiness resolves only the relevant Gateway settings, so
+unrelated shared configuration includes do not block health checks. With
+`gateway.tls.enabled: true`, OCM verifies the peer
+against the environment's configured public `gateway.tls.certPath`, or the
+Gateway's default `.openclaw/gateway/tls/gateway-cert.pem`, and verifies its TLS
+handshake. This supports the Gateway's generated self-signed certificates as
+well as explicitly configured certificates. Relative certificate paths follow
+the Gateway's launch directory; `~` follows its isolated OpenClaw home. OCM
+never generates certificates or reads the server private key. Once TLS is selected
+for a readiness wait, OCM never switches to plaintext after configuration,
+certificate, handshake, or health-check failures. A successful native lookup can
+complete an initially partial observation, respecting later include overrides;
+failed or unavailable resolution retains any partial TLS evidence. For templated certificate paths in dev and
+installed OpenClaw package bindings, it makes one private, bounded native
+`config get gateway --json` call so OpenClaw owns `.env` resolution. The same
+native lookup resolves needed includes that its own include-root policy permits.
+The result is reused while observing that child; a supervised replacement gets
+a fresh lookup within the same readiness deadline, retaining any observed TLS requirement.
+Generic launchers and registered executables are not sent configuration commands;
+their certificate paths use literals, supervised-process variables, or `config.env` values.
+For a generic launcher whose transport cannot be observed within the admitted
+configuration roots, OCM retains the ordinary HTTP health check only when it has
+not observed TLS enabled. TLS enabled solely inside a wrapper's private
+configuration remains unsupported and can receive that legacy HTTP probe.
+Unknown certificate settings after TLS is observed, missing or mismatched
+certificates, and failed native configuration lookups keep the Gateway unready
+within the normal readiness timeout. HTTP environments retain the ordinary
+HTTP health check.
+
 On Unix, OCM waits for Gateway PID publication before moving a matching caller
 out of the Gateway process group during daemon refresh, snapshot, or upgrade
 maintenance. This protects the caller from the supervisor's signals to that

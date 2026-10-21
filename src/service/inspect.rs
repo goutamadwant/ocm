@@ -174,10 +174,41 @@ pub(crate) fn service_status_for_readiness(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<ServiceSummary, String> {
+    service_readiness_observation(name, env, cwd).map(|(status, _)| status)
+}
+
+pub(super) fn service_readiness_observation(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(ServiceSummary, Option<SupervisorChildSpec>), String> {
     let env_service = EnvironmentService::new(env, cwd);
     let meta = env_service.get(name)?;
     let snapshot = load_service_snapshot(env, cwd, true)?;
-    build_service_summary(&env_service, &meta, env, cwd, &snapshot)
+    let status = build_service_summary(&env_service, &meta, env, cwd, &snapshot)?;
+    // Informational plans are rebuilt from the caller environment. Readiness
+    // needs the persisted plan actually consumed by the spawning daemon, which
+    // self-update intentionally preserves across executable replacement.
+    let child = if status.running {
+        SupervisorService::new(env, cwd).persisted_child_spec(name)?
+    } else {
+        None
+    };
+    let child = child.filter(|planned| {
+        snapshot.runtime_children.get(name).is_none_or(|running| {
+            running.binding_kind == planned.binding_kind
+                && running.binding_name == planned.binding_name
+                && running
+                    .launch_spec_sha256
+                    .as_ref()
+                    .is_none_or(|hash| planned.launch_spec_sha256().as_ref() == Some(hash))
+        })
+    });
+    // A new plan can be published before its replacement child starts. Never
+    // query the new configuration on behalf of the still-running old child.
+    // Older records have no spec hash and retain their authoritative observed
+    // child port, which may differ from the currently planned port.
+    Ok((status, child))
 }
 
 fn load_service_snapshot(

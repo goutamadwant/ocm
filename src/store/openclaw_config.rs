@@ -15,8 +15,9 @@ use super::common::{ensure_dir, path_exists, write_file_replacing_path};
 use super::gateway_ports::read_port_number;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
-    OpenClawConfigReadContext, OpenClawWorkspaceInventory, load_effective_openclaw_config,
-    normalize_agent_id, read_openclaw_config_field, read_regular_text_file,
+    OpenClawConfigReadContext, OpenClawConfigReadError, OpenClawWorkspaceInventory,
+    OpenClawWorkspaceRuntime, load_effective_openclaw_config, normalize_agent_id,
+    read_openclaw_config_field, read_regular_text_file, resolve_openclaw_config_env,
 };
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1003,6 +1004,149 @@ fn minimum_local_config_value(
     }
 
     Ok(value)
+}
+
+/// Resolve only public TLS material; the Gateway owns key loading and generation.
+pub(crate) fn gateway_readiness_certificate(
+    meta: &EnvMeta,
+    port: u32,
+    run_dir: &Path,
+    env: &BTreeMap<String, String>,
+    known_tls: &mut bool,
+    resolve_native: impl FnOnce() -> Result<Option<Value>, String>,
+) -> Result<Option<Vec<u8>>, String> {
+    let paths = derive_env_paths(Path::new(&meta.root));
+    let context = OpenClawConfigReadContext::for_launch(env, run_dir)?;
+    let enabled =
+        read_openclaw_config_field(&paths.config_path, &["gateway", "tls", "enabled"], &context);
+    // A fully resolved false may override an earlier true in an include array.
+    // Partial resolution cannot discard that evidence and choose plaintext.
+    let partial_tls = enabled.value.is_err() && enabled.observed_true;
+    let local = (|| -> Result<Value, OpenClawConfigReadError> {
+        let enabled = match enabled.value? {
+            None | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => true,
+            Some(_) => {
+                return Err(OpenClawConfigReadError::Invalid(
+                    "Gateway TLS enabled setting must be a boolean".to_string(),
+                ));
+            }
+        };
+        if !enabled {
+            return Ok(json!({"gateway": {"tls": {"enabled": false}}}));
+        }
+        *known_tls = true;
+        let certificate = read_openclaw_config_field(
+            &paths.config_path,
+            &["gateway", "tls", "certPath"],
+            &context,
+        )
+        .value?;
+        let mut config = json!({"gateway": {"tls": {"enabled": true}}});
+        if let Some(certificate) = certificate {
+            if !certificate.is_string() {
+                return Err(OpenClawConfigReadError::Invalid(
+                    "Gateway TLS certificate path must be a string".to_string(),
+                ));
+            }
+            config["gateway"]["tls"]["certPath"] = certificate;
+        }
+        Ok(config)
+    })();
+    let templated_certificate = local
+        .as_ref()
+        .ok()
+        .and_then(|value| value.pointer("/gateway/tls/certPath"))
+        .and_then(Value::as_str)
+        .is_some_and(|path| path.contains("${"));
+    // Only an unavailable read-authority context may use native resolution or
+    // the generic legacy HTTP exception. Invalid/in-bound failures stay errors.
+    let native = if matches!(&local, Err(OpenClawConfigReadError::OutsideAuthority(_)))
+        || templated_certificate
+    {
+        match resolve_native() {
+            Ok(value) => value,
+            Err(error) => {
+                *known_tls |= partial_tls;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let native_resolved = native.is_some();
+    // A successful native lookup completes this initial observation using the
+    // whole ordered include graph. Preserve partial evidence only while it is
+    // unresolved; never erase a transport chosen during an earlier observation.
+    if !native_resolved {
+        *known_tls |= partial_tls;
+    }
+    let mut config = match native {
+        Some(gateway) => json!({"gateway": gateway}),
+        None => match local {
+            Ok(config) => config,
+            Err(OpenClawConfigReadError::OutsideAuthority(_)) if !*known_tls => {
+                // Known-native bindings return a value or an error, never None.
+                // A generic command is not invoked to discover capabilities.
+                return Ok(None);
+            }
+            Err(error) => return Err(error.to_string()),
+        },
+    };
+    let enabled = match config.pointer("/gateway/tls/enabled") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => return Err("Gateway TLS enabled setting must be a boolean".to_string()),
+    };
+    if !enabled {
+        if *known_tls {
+            return Err("Gateway TLS was observed during this readiness wait; refusing a plaintext health probe".to_string());
+        }
+        return Ok(None);
+    }
+    *known_tls = true;
+    if templated_certificate && !native_resolved {
+        // Only generic templated bindings need config.env; native bindings own
+        // their complete variable-source rules, including dotenv.
+        if let Some(values) = read_openclaw_config_field(&paths.config_path, &["env"], &context)
+            .value
+            .map_err(|error| error.to_string())?
+        {
+            config["env"] = values;
+        }
+        config = resolve_openclaw_config_env(
+            config,
+            env,
+            &paths.openclaw_home,
+            &paths.state_dir,
+            &paths.config_path,
+            OpenClawWorkspaceRuntime::for_env(&meta.name, Some(port)),
+        );
+    }
+    let certificate_path = config.pointer("/gateway/tls/certPath");
+    if certificate_path.is_some_and(|value| !value.is_string()) {
+        return Err("Gateway TLS certificate path must be a string".to_string());
+    }
+    let raw = certificate_path
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let cert_path = match raw {
+        None => paths.state_dir.join("gateway/tls/gateway-cert.pem"),
+        Some("~") => paths.openclaw_home.clone(),
+        Some(value) if value.starts_with("~/") || value.starts_with("~\\") => {
+            let mut expanded = paths.openclaw_home.as_os_str().to_os_string();
+            expanded.push(&value[1..]);
+            PathBuf::from(expanded)
+        }
+        Some(value) => run_dir.join(value),
+    };
+    // Match OpenClaw's bounded public-leaf inspection, including configured symlinks.
+    let pem = read_regular_text_file(&cert_path, "Gateway TLS certificate", Some(64 * 1024))
+        .map_err(|_| "Gateway TLS public certificate could not be read (missing, unreadable, nonregular, or oversized)".to_string())?;
+    let certificate = ureq::tls::Certificate::from_pem(pem.as_bytes())
+        .map_err(|_| "Gateway TLS certificate is not a PEM certificate".to_string())?;
+    Ok(Some(certificate.der().to_vec()))
 }
 
 pub(crate) fn dev_ui_gateway_base_path(paths: &EnvPaths) -> Result<String, String> {
@@ -2177,6 +2321,58 @@ mod tests {
             std::process::id(),
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ))
+    }
+
+    #[test]
+    fn readiness_certificate_uses_isolated_home_and_fails_closed_on_missing_or_invalid_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = derive_env_paths(&root.path().join("environment"));
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let meta = meta("demo", paths.root.to_str().unwrap(), Some(18789));
+        let cert_path = paths.openclaw_home.join("cert.pem");
+        // This tests path/PEM resolution only; live TLS tests prove certificate
+        // and handshake validity with a real synthetic certificate/key pair.
+        let pem = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+        fs::write(&cert_path, pem).unwrap();
+        let config = json!({"gateway":{"tls":{"enabled":true,"certPath":" ~/cert.pem "}}});
+        let original = serde_json::to_vec(&config).unwrap();
+        fs::write(&paths.config_path, &original).unwrap();
+        let env = BTreeMap::from([(
+            "HOME".to_string(),
+            display_path(&root.path().join("wrong-home")),
+        )]);
+        let mut known_tls = false;
+        assert_eq!(
+            gateway_readiness_certificate(&meta, 18789, root.path(), &env, &mut known_tls, || Ok(
+                None
+            ))
+            .unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        fs::remove_file(&cert_path).unwrap();
+        assert!(
+            gateway_readiness_certificate(&meta, 18789, root.path(), &env, &mut known_tls, || Ok(
+                None
+            ))
+            .is_err()
+        );
+        fs::write(&cert_path, "invalid public certificate").unwrap();
+        assert!(
+            gateway_readiness_certificate(&meta, 18789, root.path(), &env, &mut known_tls, || Ok(
+                None
+            ))
+            .is_err()
+        );
+        fs::write(&cert_path, pem).unwrap();
+        assert!(
+            gateway_readiness_certificate(&meta, 18789, root.path(), &env, &mut known_tls, || Ok(
+                None
+            ))
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(fs::read(&paths.config_path).unwrap(), original);
+        assert!(!paths.state_dir.join("gateway/tls/gateway-key.pem").exists());
     }
 
     #[test]

@@ -42,6 +42,7 @@ use crate::store::{
 };
 
 mod openclaw_handoff;
+pub(crate) use openclaw_handoff::read_private_config_command;
 mod ownership;
 
 pub use ownership::{ServiceRecoverySummary, SupervisorRetainedOwnership};
@@ -633,6 +634,17 @@ impl<'a> SupervisorService<'a> {
             (!inspection.daemon.running).then(|| "supervisor is not running".to_string())
         });
         Ok((inspection, issue))
+    }
+
+    pub(crate) fn persisted_child_spec(
+        &self,
+        name: &str,
+    ) -> Result<Option<SupervisorChildSpec>, String> {
+        let (_, state) = self.read_persisted_state()?;
+        Ok(state
+            .children
+            .into_iter()
+            .find(|child| child.env_name == name))
     }
 
     fn inspect_with_checked_daemon(
@@ -1491,8 +1503,9 @@ impl<'a> SupervisorService<'a> {
     ) -> Result<SupervisorRunSummary, String> {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let signal_flag = Arc::clone(&stop_requested);
-        ctrlc::set_handler(move || {
+        crate::infra::interrupt::set_handler(move || {
             signal_flag.store(true, Ordering::SeqCst);
+            true
         })
         .map_err(|error| format!("failed to install service signal handler: {error}"))?;
 
