@@ -609,9 +609,132 @@ fn removal_preserves_git_object_and_alternates_path_aliases() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn nested_pack_storage_is_protected_by_removal_and_registration() {
+    use std::os::unix::fs::symlink;
+    for mode in [
+        "primary",
+        "alternate",
+        "link-chain",
+        "files",
+        "independent-copy",
+    ] {
+        let fixture = TestDir::new(&format!("nested-pack-{mode}"));
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let container = create("container", None, None, &env, cwd).unwrap();
+        let original = init_checkout(&fixture.child("original"));
+        git(&original, &["repack", "-ad"]);
+        git(&original, &["prune-packed"]);
+        let packs = original.join(".git/objects/pack");
+        assert!(fs::read_dir(&packs).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "pack")
+        }));
+        let dependency = Path::new(&container.root).join("packed-objects");
+        match mode {
+            "files" => {
+                fs::create_dir(&dependency).unwrap();
+                for entry in fs::read_dir(&packs).unwrap() {
+                    let entry = entry.unwrap();
+                    let target = dependency.join(entry.file_name());
+                    fs::rename(entry.path(), &target).unwrap();
+                    symlink(target, entry.path()).unwrap();
+                }
+            }
+            "independent-copy" => {
+                fs::create_dir(&dependency).unwrap();
+                for entry in fs::read_dir(&packs).unwrap() {
+                    let entry = entry.unwrap();
+                    fs::copy(entry.path(), dependency.join(entry.file_name())).unwrap();
+                }
+            }
+            "link-chain" => {
+                let outside = fixture.child("outside-packs");
+                fs::rename(&packs, &outside).unwrap();
+                symlink(&outside, &dependency).unwrap();
+                symlink(&dependency, &packs).unwrap();
+            }
+            _ => {
+                fs::rename(&packs, &dependency).unwrap();
+                symlink(&dependency, &packs).unwrap();
+            }
+        }
+        let source = if mode == "alternate" {
+            let source = fixture.child("shared-source");
+            git(
+                cwd,
+                &[
+                    "clone",
+                    "--shared",
+                    &path_string(&original),
+                    &path_string(&source),
+                ],
+            );
+            source
+        } else {
+            original
+        };
+        let source = fs::canonicalize(source).unwrap();
+        assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
+        git(&source, &["fsck", "--full", "--no-dangling"]);
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before = fs::read(&registry).unwrap();
+        let lock = support::hold_environment_operation(&fixture, "container");
+        let admitted = create("borrower", None, Some(borrowed(&source)), &env, cwd);
+        if mode == "independent-copy" {
+            admitted.unwrap();
+        } else {
+            let error = admitted.unwrap_err();
+            assert!(error.contains("container"), "{mode}: {error}");
+            assert_eq!(fs::read(&registry).unwrap(), before);
+        }
+        drop(lock);
+        if mode != "independent-copy" {
+            create("borrower", None, Some(borrowed(&source)), &env, cwd).unwrap();
+        }
+        let before = fs::read(&registry).unwrap();
+        for force in [false, true] {
+            let mut args = vec!["env", "remove", "container"];
+            if force {
+                args.push("--force");
+            }
+            let removed = run_ocm(cwd, &env, &args);
+            if mode == "independent-copy" {
+                assert!(removed.status.success(), "{}", stderr(&removed));
+                assert!(!Path::new(&container.root).exists());
+                break;
+            }
+            assert!(!removed.status.success(), "{mode}");
+            assert!(
+                stderr(&removed).contains("registered dev source"),
+                "{}",
+                stderr(&removed)
+            );
+            assert!(dependency.exists());
+            assert_eq!(fs::read(&registry).unwrap(), before);
+        }
+        assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
+        git(&source, &["fsck", "--full", "--no-dangling"]);
+        assert!(git(&source, &["status", "--porcelain"]).is_empty());
+    }
+}
+
 #[test]
 fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
-    for mode in ["missing", "directory", "oversized", "too-many"] {
+    for mode in [
+        "missing",
+        "directory",
+        "oversized",
+        "too-many",
+        "pack-entries",
+        #[cfg(unix)]
+        "pack-alias-limit",
+    ] {
         let fixture = TestDir::new(&format!("git-alternate-metadata-{mode}"));
         let cwd = fixture.path();
         let env = ocm_env(&fixture);
@@ -646,6 +769,21 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
                 fs::create_dir(&alternates).unwrap();
             }
             "oversized" => write_text(&alternates, &"#".repeat(65537)),
+            "pack-entries" => {
+                for index in 0..1024 {
+                    write_text(&source.join(format!(".git/objects/pack/entry-{index}")), "");
+                }
+            }
+            #[cfg(unix)]
+            "pack-alias-limit" => {
+                for index in 0..1024 {
+                    std::os::unix::fs::symlink(
+                        &alternates,
+                        source.join(format!(".git/objects/pack/entry-{index}")),
+                    )
+                    .unwrap();
+                }
+            }
             _ => write_text(&alternates, &".\n".repeat(1024)),
         }
         let registry = env_registry_path(&env, cwd).unwrap();
@@ -653,8 +791,9 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
         let removed = run_ocm(cwd, &env, &["env", "remove", "donor"]);
         assert!(!removed.status.success(), "{mode}");
         let expected = match mode {
-            "missing" => "registered dev source",
+            "missing" | "pack-entries" => "registered dev source",
             "too-many" => "too many alternate paths",
+            "pack-alias-limit" => "too many pack alias paths",
             _ => "invalid Git alternates file",
         };
         assert!(
@@ -668,7 +807,7 @@ fn removal_preserves_known_alternates_when_metadata_is_missing_or_invalid() {
         }
         assert!(donor_root.exists());
         assert_eq!(fs::read(&registry).unwrap(), before);
-        if mode == "missing" {
+        if mode == "missing" || mode == "pack-entries" {
             // Missing unrelated storage remains reserved but does not block a
             // disjoint removal or hide the surviving donor dependency.
             let removed = run_ocm(cwd, &env, &["env", "remove", "unrelated"]);
