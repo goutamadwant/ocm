@@ -245,13 +245,25 @@ ocm runtime build-local primary-test \
 OCM reads the target environment's effective config before `npm pack`, validates
 explicit plugin references against the checkout and installed-plugin records,
 including the native SQLite index, inline config and legacy JSON records,
-and follows transitive local plugin package dependencies. Installed external
-plugins satisfy that validation without being bundled into the new runtime;
-installed records do not select additional plugins. Disabled entries and denied
-plugins remain excluded from the explicit selection, even when their identifiers
-remain in `plugins.allow`. Explicit slot references still require the selected
-plugin to be available. The resulting runtime
-adds only required source plugins omitted from the core package. `--for-env` and
+and follows transitive local plugin package dependencies. Policy IDs are trimmed
+and compared without case distinctions. OCM recognizes the native built-in
+aliases `google-gemini-cli` → `google` and `minimax-portal` /
+`minimax-portal-auth` → `minimax`. An exact declared source ID takes precedence,
+so older checkouts keep their legacy identity even if a canonical installed
+record exists. Installed legacy IDs remain recognized when their canonical
+replacement is unavailable. Authored config and declared manifest IDs remain
+unchanged; unknown enabled references still fail validation.
+
+Installed external plugins satisfy that validation without being bundled into
+the new runtime; installed records do not select additional plugins. Disabled
+entries and denied plugins remain excluded even when their identifiers remain
+in `plugins.allow` under a supported alias or case variant, including when the
+plugin is no longer installed. Disable and deny references use the same
+selected-source identity rules. Alias/case-equivalent entries share enablement:
+a later object without `enabled` preserves the previous value, while a later
+explicit boolean replaces it. Explicit slot references still require the
+selected plugin to be available. The resulting runtime adds only required
+source plugins omitted from the core package. `--for-env` and
 `--include-source-extensions` are mutually exclusive. A build without either
 option remains release-shaped.
 

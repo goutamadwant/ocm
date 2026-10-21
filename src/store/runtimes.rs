@@ -691,11 +691,42 @@ fn collect_plugin_ids_from_records(value: &serde_json::Value, ids: &mut BTreeSet
 }
 
 fn normalized_plugin_id(id: &str) -> Option<String> {
-    let id = id.trim();
-    (!id.is_empty()).then(|| id.to_string())
+    let id = id.trim().to_lowercase();
+    (!id.is_empty()).then_some(id)
 }
 
-fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<String> {
+fn target_plugin_id(
+    id: &str,
+    source_ids: &BTreeMap<String, String>,
+    installed: &BTreeSet<String>,
+) -> Option<String> {
+    let id = normalized_plugin_id(id)?;
+    if source_ids.contains_key(&id) {
+        return Some(id);
+    }
+    // Modern OpenClaw maps these legacy IDs to canonical plugins. Older checkouts can still
+    // declare the legacy ID itself; that source identity takes precedence over installed records.
+    let canonical = match id.as_str() {
+        "google-gemini-cli" => "google",
+        "minimax-portal" | "minimax-portal-auth" => "minimax",
+        _ => return Some(id),
+    };
+    if installed.contains(&id)
+        && !source_ids.contains_key(canonical)
+        && !installed.contains(canonical)
+    {
+        return Some(id);
+    }
+    // Disable and deny policy must still match aliases after a plugin has been removed.
+    // Availability is checked separately after the complete policy has been collected.
+    Some(canonical.to_string())
+}
+
+fn collect_explicit_plugin_references(
+    config: &serde_json::Value,
+    source_ids: &BTreeMap<String, String>,
+    installed: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let Some(plugins) = config.get("plugins").and_then(serde_json::Value::as_object) else {
         return ids;
@@ -705,19 +736,31 @@ fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<St
             values
                 .iter()
                 .filter_map(serde_json::Value::as_str)
-                .filter_map(normalized_plugin_id),
+                .filter_map(|id| target_plugin_id(id, source_ids, installed)),
         );
     }
     if let Some(entries) = plugins
         .get("entries")
         .and_then(serde_json::Value::as_object)
     {
+        let mut entry_enabled = BTreeMap::<String, Option<bool>>::new();
         for (id, entry) in entries {
-            let Some(id) = normalized_plugin_id(id) else {
+            let Some(id) = target_plugin_id(id, source_ids, installed) else {
                 continue;
             };
+            // Native normalization merges alias/case-equivalent objects in authored order.
+            // An omitted boolean preserves earlier enablement; an explicit boolean replaces it.
+            let enabled = entry.as_object().and_then(|entry| {
+                entry
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .or_else(|| entry_enabled.get(&id).copied().flatten())
+            });
+            entry_enabled.insert(id, enabled);
+        }
+        for (id, enabled) in entry_enabled {
             // Disabling a plugin can leave its identifier in the allowlist.
-            if entry.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            if enabled == Some(false) {
                 ids.remove(&id);
             } else {
                 ids.insert(id);
@@ -730,12 +773,16 @@ fn collect_explicit_plugin_references(config: &serde_json::Value) -> BTreeSet<St
                 .values()
                 .filter_map(serde_json::Value::as_str)
                 .filter(|id| id.trim() != "none")
-                .filter_map(normalized_plugin_id),
+                .filter_map(|id| target_plugin_id(id, source_ids, installed)),
         );
     }
     if let Some(deny) = plugins.get("deny").and_then(serde_json::Value::as_array) {
-        for id in deny.iter().filter_map(serde_json::Value::as_str) {
-            ids.remove(id.trim());
+        for id in deny
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter_map(|id| target_plugin_id(id, source_ids, installed))
+        {
+            ids.remove(&id);
         }
     }
     ids
@@ -779,12 +826,22 @@ fn resolve_target_source_plugin_closure(
     // Only OpenClaw's explicit plugin policy fields are part of this contract. Inferring plugin
     // ids from arbitrary provider, agent, or plugin-owned config would create false dependencies.
     let inventory = source_plugin_inventory(repo_path)?;
-    let source_ids = inventory.by_id.keys().cloned().collect::<BTreeSet<_>>();
-    let explicit = collect_explicit_plugin_references(&config);
+    // Resolve policy keys back to declared manifest IDs. Packaging and dependency closure must
+    // retain those IDs, including their case, to match built manifests and runtime exports.
+    let mut source_ids = BTreeMap::new();
+    for id in inventory.by_id.keys() {
+        let policy_id = id.to_lowercase();
+        if let Some(previous) = source_ids.insert(policy_id.clone(), id.clone()) {
+            return Err(format!(
+                "source plugin policy id \"{policy_id}\" is ambiguous between plugin ids \"{previous}\" and \"{id}\""
+            ));
+        }
+    }
     let installed = installed_target_plugin_ids(&paths, &config);
+    let explicit = collect_explicit_plugin_references(&config, &source_ids, &installed);
     let missing = explicit
         .iter()
-        .filter(|id| !source_ids.contains(*id) && !installed.contains(*id))
+        .filter(|id| !source_ids.contains_key(*id) && !installed.contains(*id))
         .cloned()
         .collect::<Vec<_>>();
     if !missing.is_empty() {
@@ -794,7 +851,10 @@ fn resolve_target_source_plugin_closure(
         ));
     }
 
-    let mut direct = explicit;
+    let mut direct = explicit
+        .iter()
+        .filter_map(|id| source_ids.get(id).cloned())
+        .collect::<BTreeSet<_>>();
     direct.retain(|id| {
         inventory
             .by_id
@@ -3839,6 +3899,51 @@ mod tests {
     }
 
     #[test]
+    fn target_plugin_identity_matches_native_aliases_and_case() {
+        let installed = BTreeSet::from(["google".to_string(), "minimax".to_string()]);
+        for (raw, expected) in [
+            ("google", Some("google")),
+            (" GOOGLE-GEMINI-CLI ", Some("google")),
+            ("Minimax-Portal", Some("minimax")),
+            ("minimax-portal-auth", Some("minimax")),
+            (" External ", Some("external")),
+            ("google-gemini-cli-auth", Some("google-gemini-cli-auth")),
+            ("unknown", Some("unknown")),
+            ("  ", None),
+        ] {
+            assert_eq!(
+                super::target_plugin_id(raw, &BTreeMap::new(), &installed).as_deref(),
+                expected
+            );
+        }
+        for legacy in ["google-gemini-cli", "minimax-portal-auth"] {
+            let source_ids = BTreeMap::from([(legacy.to_string(), legacy.to_string())]);
+            assert_eq!(
+                super::target_plugin_id(legacy, &source_ids, &installed).as_deref(),
+                Some(legacy)
+            );
+            assert_eq!(
+                super::target_plugin_id(
+                    legacy,
+                    &BTreeMap::new(),
+                    &BTreeSet::from([legacy.to_string()])
+                )
+                .as_deref(),
+                Some(legacy)
+            );
+        }
+        let config = serde_json::json!({"plugins": {
+            "entries": {"google-gemini-cli": {"enabled": true}},
+            "allow": ["MINIMAX-PORTAL", " External "],
+            "deny": ["GOOGLE", "minimax-portal-auth"]
+        }});
+        assert_eq!(
+            collect_explicit_plugin_references(&config, &BTreeMap::new(), &installed),
+            BTreeSet::from(["external".to_string()])
+        );
+    }
+
+    #[test]
     fn target_plugin_references_ignore_arbitrary_matching_config_values() {
         let config = serde_json::json!({
             "agents": { "list": [{ "id": "codex" }] },
@@ -3854,7 +3959,7 @@ mod tests {
         });
 
         assert_eq!(
-            collect_explicit_plugin_references(&config),
+            collect_explicit_plugin_references(&config, &BTreeMap::new(), &BTreeSet::new()),
             BTreeSet::from([
                 "allowed".to_string(),
                 "memory-core".to_string(),
