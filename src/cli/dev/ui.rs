@@ -226,11 +226,10 @@ impl DevUiTarget {
         source: &Path,
         env: &BTreeMap<String, String>,
     ) -> Command {
-        let args = vec![
-            display_path(&source.join("openclaw.mjs")),
+        let args = crate::env::source_watch_openclaw_program_args(&[
             "dashboard".to_string(),
             "--json".to_string(),
-        ];
+        ]);
         let mut command = gated_dev_command("node", &args);
         command
             .stdin(Stdio::null())

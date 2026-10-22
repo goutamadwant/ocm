@@ -106,12 +106,58 @@ jobs:
         run: cargo test --locked --lib openclaw_repo::tests::owned_worktree_uses_canonical_repository_paths -- --exact --nocapture
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22.15.0'
+          node-version: '22.23.4'
           package-manager-cache: false
       - name: Prove native Windows dev stop lifecycle
         run: |
           cargo test --locked --lib windows_source_watch_ -- --nocapture
           cargo test --locked --test windows_dev_stop_tests native_windows_dev_stop_lifecycle -- --exact --nocapture
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        with:
+          ref: 223395b59718f2c32565a8eac83a879355158508
+          path: base
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        with:
+          node-version: '22.15.0'
+          package-manager-cache: false
+      - name: Record previous runtime
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        shell: pwsh
+        run: '"PAIR_OLD_NODE=$((Get-Command node).Source)" >> $env:GITHUB_ENV'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        with:
+          node-version: '22.23.4'
+          package-manager-cache: false
+      - name: Record patched runtime and runner resources
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        shell: pwsh
+        run: |
+          "PAIR_NEW_NODE=$((Get-Command node).Source)" >> $env:GITHUB_ENV
+          Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory,NumberOfLogicalProcessors | ConvertTo-Json
+          Get-PSDrive C | Select-Object Used,Free | ConvertTo-Json
+      - name: Compare pinned revisions and runtimes serially
+        timeout-minutes: 80
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        shell: pwsh
+        run: python candidate/scripts/validate-runtime-pair.py candidate base "$env:RUNNER_TEMP/runtime-regression-pair"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568
+        with:
+          name: runtime-regression-pair
+          path: ${{ runner.temp }}/runtime-regression-pair
+          if-no-files-found: error
+          retention-days: 7
 
   test:
     # Keep required check names stable when runner labels change.
@@ -133,19 +179,46 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24.21.0'
+          node-version: '24.22.1'
           package-manager-cache: false
       - name: Prove macOS private config creation across users
         if: runner.os == 'macOS'
         run: |
           private_config_test_binary=$(cargo test --locked --lib --no-run --message-format=json | python3 -c 'import json,sys; paths=[entry["executable"] for line in sys.stdin if (entry:=json.loads(line)).get("reason")=="compiler-artifact" and entry.get("profile",{}).get("test") and entry.get("executable")]; assert len(paths)==1,paths; print(paths[0])')
           sudo -n -- "$private_config_test_binary" --ignored --exact store::openclaw_config::macos_privacy_tests::private_config_creation_excludes_other_users --nocapture
+      - name: Build upgrade candidate (finite PR568 validation)
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 568 && runner.os == 'Linux'
+        run: cargo install --locked --path . --root "$RUNNER_TEMP/ocm-install"
+      - name: Prove real released-predecessor service upgrade (finite PR568 validation)
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 568 && runner.os == 'Linux'
+        timeout-minutes: 25
+        run: |
+          proof="$RUNNER_TEMP/ocm-released-upgrade"
+          prefix="/opt/ocm-pr568-$GITHUB_RUN_ID"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 "$prefix"
+          python3 scripts/validate-released-upgrade.py prepare --prefix "$prefix" --output "$proof" --candidate "$RUNNER_TEMP/ocm-install/bin/ocm"
+          cargo install --locked --path . --root "$prefix" --force
+          python3 scripts/validate-released-upgrade.py verify --prefix "$prefix" --output "$proof"
+      - name: Release owned upgrade service and user
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.number == 568 && runner.os == 'Linux'
+        run: python3 scripts/validate-released-upgrade.py cleanup --prefix "/opt/ocm-pr568-$GITHUB_RUN_ID" --output "$RUNNER_TEMP/ocm-released-upgrade"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568 && runner.os == 'Linux'
+        with:
+          name: released-predecessor-upgrade
+          path: |
+            ${{ runner.temp }}/ocm-released-upgrade/*.json
+            ${{ runner.temp }}/ocm-released-upgrade/*.log
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Run test suite
         run: cargo test --locked
       - name: Smoke test cargo install
         run: |
           cargo install --locked --path . --root "$RUNNER_TEMP/ocm-install"
           "$RUNNER_TEMP/ocm-install/bin/ocm" --version
+
 
   npm:
     name: npm (${{ matrix.name }}, Node ${{ matrix.node }})
@@ -154,10 +227,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, name: ubuntu-latest, arch: x64, node: '22.15.0', prefix: '' }
-          - { os: ubuntu-latest, name: ubuntu-latest, arch: x64, node: '24', prefix: '' }
-          - { os: xcode-27, name: xcode-27-x86_64, arch: x64, node: '24', prefix: 'arch -x86_64' }
-          - { os: xcode-27, name: xcode-27-arm64, arch: arm64, node: '24', prefix: '' }
+          - { os: ubuntu-latest, name: ubuntu-latest, arch: x64, node: '22.23.4', prefix: '' }
+          - { os: ubuntu-latest, name: ubuntu-latest, arch: x64, node: '24.22.1', prefix: '' }
+          - { os: xcode-27, name: xcode-27-x86_64, arch: x64, node: '24.22.1', prefix: 'arch -x86_64' }
+          - { os: xcode-27, name: xcode-27-arm64, arch: arm64, node: '24.22.1', prefix: '' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -187,7 +260,7 @@ jobs:
           echo "block return out quick proto udp from any to any port 443" | sudo pfctl -f -
           sudo pfctl -E
       - name: Prove signed native byte preservation through npm
-        if: matrix.node == '24'
+        if: matrix.node == '24.22.1'
         env:
           GH_TOKEN: ${{ github.token }}
           MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}

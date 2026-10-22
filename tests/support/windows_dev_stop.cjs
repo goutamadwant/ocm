@@ -161,7 +161,7 @@ async function start(name, watching = true, withUi = false, defaults = false) {
     for (const entry of ['watch-node.mjs', 'run-node.mjs']) {
       fs.writeFileSync(path.join(repo, 'scripts', entry), "import './dev-ui-fixture.cjs';\n");
     }
-    fs.writeFileSync(path.join(repo, 'openclaw.mjs'), "import './scripts/dev-ui-fixture.cjs';\n");
+    fs.writeFileSync(path.join(repo, 'openclaw.mjs'), "if (process.argv.includes('--version')) console.log('source-entry:' + process.version); else await import('./scripts/dev-ui-fixture.cjs');\n");
     for (const name of ['vite', 'dompurify']) {
       const module = path.join(repo, 'node_modules', name);
       fs.mkdirSync(module, {recursive:true});
@@ -193,12 +193,17 @@ async function start(name, watching = true, withUi = false, defaults = false) {
   }
   const modes = defaults ? [] : [watching ? '--watch' : '--no-watch', withUi ? '--ui' : '--no-ui'];
   const args = ['dev',name,...(defaults ? [] : ['--repo',repo]),...(takeover ? ['--force'] : ['--root',envRoot,'--port',port]),...modes];
+  // Capture pre-entry failures only inside this synthetic fixture. The real
+  // dashboard owner intentionally keeps child stderr private.
+  const diagnostic = path.join(directory, 'node-entry-diagnostic.cjs');
+  const diagnosticLog = path.join(directory, 'node-entry-diagnostic.log');
+  fs.writeFileSync(diagnostic, 'process.on("uncaughtExceptionMonitor",error=>require("node:fs").appendFileSync(' + JSON.stringify(diagnosticLog) + ',String(error.stack)+"\\n"));\n');
   const sourceEnv = {
     ...env,
     ...(withUi ? {OCM_TEST_DEV_UI_DIR:directory, OCM_TEST_DEV_UI_DESCENDANTS:'1', OCM_TEST_UI_BASE:'/console'} : {}),
     NoDe_CoMpIlE_CaChE: path.join(directory, 'inherited-cache'),
     nOdE_dIsAbLe_CoMpIlE_cAcHe: '0',
-    NODE_OPTIONS: '--no-warnings'
+    NODE_OPTIONS: '--no-warnings --require=' + JSON.stringify(diagnostic)
   };
   const controller = cp.spawn(binary, args, {cwd:defaults ? repo : root, env:sourceEnv, stdio:['ignore','pipe','pipe'], windowsHide:true});
   const output = capture(controller);
@@ -240,7 +245,7 @@ async function start(name, watching = true, withUi = false, defaults = false) {
     assert.ok(!fs.existsSync(path.join(directory, 'dashboard-attempts')), 'Gateway document readiness was bypassed');
     fs.writeFileSync(path.join(directory, 'gateway-document-ready'), 'ready');
     const helperFile = path.join(directory, 'dashboard-attempt-1');
-    await waitFor(() => fs.existsSync(helperFile), () => 'Native handoff did not start\n' + output());
+    await waitFor(() => fs.existsSync(helperFile), () => 'Native handoff did not start\n' + output() + (fs.existsSync(diagnosticLog) ? '\n' + fs.readFileSync(diagnosticLog, 'utf8') : ''));
     const pid = Number(fs.readFileSync(helperFile));
     const helperIdentity = {pid, startedAt:startIdentity(pid)};
     assert.deepEqual(session(name).ui.children.command, helperIdentity);
@@ -312,12 +317,24 @@ for (const [signal, code] of [['SIGINT',130],['SIGTERM',143]]) process.once(sign
     assert.equal(native('ready').ready, true);
     run(['runtime','add','proof-node','--path',process.execPath]);
     const normal = await start('normal.stop', true, true, true);
+    // Keep this regression on the canonical extended Windows source path.
+    assert.ok(normal.output().includes("source=\\\\?\\"), "Windows fixture must retain its extended source path");
     fs.rmSync(path.join(normal.directory, 'dashboard-hold'));
     await waitFor(() => !alive(normal.helperPid) && !session(normal.name).ui.children.command && normal.output().includes('UI: '),
       'Completed initial handoff was not acknowledged');
     assert.match(normal.output(), /UI: http:\/\/127\.0\.0\.1:\d+\/#bootstrapToken=synthetic-owner-grant-1/);
     assert.ok(!normal.output().includes('synthetic-legacy'));
     assert.ok(!fs.existsSync(path.join(normal.directory, 'config-attempts')), 'Default path ran an extra config command');
+    const sourceCommands = [
+      ['env','run',normal.name,'--','--version'],
+      ['env','exec',normal.name,'--','openclaw','--version'],
+    ].map(args => {
+      const result = run(args, false);
+      return {args, status:result.status, stdout:result.stdout, stderr:result.stderr};
+    });
+    console.error(JSON.stringify({sourceCommandProbes:sourceCommands}));
+    assert.ok(sourceCommands.every(result => result.status === 0 && result.stdout.trim() === 'source-entry:' + process.version),
+      'Active source CLI commands failed: ' + JSON.stringify(sourceCommands));
     const active = JSON.parse(run(['dev','status',normal.name,'--json']).stdout);
     assert.equal(active.sourceWatch.state, 'active', 'Held watch lease was not readable by dev status');
     assert.equal(active.sourceWatch.watching, true);
