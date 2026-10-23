@@ -1558,6 +1558,73 @@ fn env_remove_preserves_source_inside_owned_git_registration() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn env_remove_preserves_linked_git_config_for_registered_source() {
+    let root = TestDir::new("env-remove-linked-git-config");
+    let repo = root.child("repo/openclaw");
+    fs::create_dir_all(repo.join("scripts")).unwrap();
+    fs::write(
+        repo.join("package.json"),
+        r#"{"name":"openclaw","version":"2026.4.19"}"#,
+    )
+    .unwrap();
+    fs::write(repo.join("scripts/run-node.mjs"), "console.log('run');\n").unwrap();
+    let initialized = Command::new("git")
+        .args(["init", "--object-format=sha256"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(initialized.status.success(), "{}", stderr(&initialized));
+    git(&repo, &["config", "user.email", "tests@example.com"]);
+    git(&repo, &["config", "user.name", "OCM Tests"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "init"]);
+
+    let mut env = ocm_launchd_env(&root);
+    install_fake_launchctl(&root, &mut env);
+    install_fake_dev_runners(&root, &mut env);
+    let donor_root = root.child("donor-root");
+    let donor = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "create",
+            "donor",
+            "--root",
+            &path_string(&donor_root),
+        ],
+    );
+    assert!(donor.status.success(), "{}", stderr(&donor));
+
+    let linked_config = donor_root.join("source.gitconfig");
+    let config = repo.join(".git/config");
+    fs::rename(&config, &linked_config).unwrap();
+    std::os::unix::fs::symlink(&linked_config, &config).unwrap();
+    assert_eq!(
+        git(&repo, &["config", "--get", "extensions.objectFormat"]),
+        "sha256"
+    );
+    let source = create_dev_source(&repo, "dependent", &env, root.path());
+
+    let unrelated = run_ocm(root.path(), &env, &["env", "create", "unrelated"]);
+    assert!(unrelated.status.success(), "{}", stderr(&unrelated));
+    let removed = run_ocm(root.path(), &env, &["env", "remove", "unrelated"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+
+    let refused = run_ocm(root.path(), &env, &["env", "remove", "donor"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("registered dev source"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(linked_config.is_file());
+    assert_eq!(git(&repo, &["rev-parse", "--verify", "HEAD"]).len(), 64);
+    assert!(Path::new(source.dev.as_ref().unwrap().source_root()).exists());
+}
+
 #[test]
 fn env_destroy_preserves_recovery_data_when_worktree_removal_fails() {
     let root = TestDir::new("env-destroy-worktree-failure");

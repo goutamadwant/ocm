@@ -348,9 +348,22 @@ fn append_git_footprint(
         record_git_path(&path, footprint, reserve_missing, links)?;
     }
     let objects = git.common_dir.join("objects");
-    for path in [git.private_dir, git.common_dir] {
+    let config_paths = [
+        git.common_dir.join("config"),
+        git.private_dir.join("config.worktree"),
+    ];
+    for path in [&git.private_dir, &git.common_dir] {
         if let Some(resolved) = record_git_path(&path, footprint, reserve_missing, links)? {
             footprint.content_roots.insert(resolved);
+        }
+    }
+    for path in config_paths {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                record_git_path(&path, footprint, reserve_missing, links)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
         }
     }
     append_git_object_footprint(
