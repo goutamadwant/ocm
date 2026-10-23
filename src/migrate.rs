@@ -8,9 +8,9 @@ use serde::Serialize;
 use crate::env::{CreateEnvironmentOptions, EnvImportSummary, EnvironmentService};
 use crate::launcher::{AddLauncherOptions, LauncherService};
 use crate::store::{
-    MigrationWorkspaceCopy, OpenClawDirectoryCopy, OpenClawWorkspaceRuntime, default_env_root,
-    derive_env_paths, display_path, list_environments, normalize_new_environment_sandbox_origin,
-    openclaw_config_include_paths, prepare_migrated_runtime_state,
+    MigrationWorkspaceCopy, OpenClawDirectoryCopy, OpenClawWorkspaceRuntime, clean_path,
+    default_env_root, derive_env_paths, display_path, list_environments,
+    normalize_new_environment_sandbox_origin, prepare_migrated_runtime_state,
     reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
     resolve_plain_openclaw_workspaces, resolve_user_home, rewrite_copied_config_include_directives,
     rewrite_external_workspace_paths_for_migration, rewrite_openclaw_config_for_migration,
@@ -67,13 +67,15 @@ struct ExternalWorkspaceCopy {
 }
 
 #[derive(Clone, Debug, Default)]
-struct ExternalWorkspaceCopyPlan {
+struct MigrationCopyPlan {
+    source_config_roots: Vec<PathBuf>,
+    config_include_paths: Vec<PathBuf>,
     default_workspace: Option<ExternalWorkspaceCopy>,
     agent_workspaces: BTreeMap<String, ExternalWorkspaceCopy>,
     copies: Vec<ExternalWorkspaceCopy>,
 }
 
-impl ExternalWorkspaceCopyPlan {
+impl MigrationCopyPlan {
     fn session_mappings(&self) -> Vec<MigrationWorkspaceCopy<'_>> {
         self.default_workspace
             .iter()
@@ -97,11 +99,26 @@ impl ExternalWorkspaceCopyPlan {
                 display_path(source_home)
             )
         })?;
-        let inventory = resolve_plain_openclaw_workspaces(&canonical_source_home, env)?;
+        let source_alias = std::path::absolute(source_home).map_err(|error| error.to_string())?;
+        let normalized_alias = clean_path(&source_alias);
+        let mut source_config_roots = vec![source_alias, canonical_source_home.clone()];
+        // Removing parent components is only another spelling of this home when
+        // filesystem identity agrees; symlink/.. can otherwise name a sibling.
+        if !source_config_roots.contains(&normalized_alias)
+            && fs::canonicalize(&normalized_alias).is_ok_and(|path| path == canonical_source_home)
+        {
+            source_config_roots.push(normalized_alias);
+        }
+        let inventory =
+            resolve_plain_openclaw_workspaces(&canonical_source_home, &source_config_roots, env)?;
         // Admission needs the supplied root spelling as well as its filesystem identity.
         let sources = inventory.workspace_sources_for_migration(source_home)?;
         let canonical_target_root = canonicalize_path_allow_missing(&target_paths.root)?;
-        let mut plan = Self::default();
+        let mut plan = Self {
+            source_config_roots,
+            config_include_paths: inventory.config_include_paths().cloned().collect(),
+            ..Self::default()
+        };
         if let Some(source) = sources.default_workspace {
             plan.default_workspace = Some(ExternalWorkspaceCopy {
                 target: target_paths.state_dir.join("workspaces/default"),
@@ -433,7 +450,7 @@ fn migrate_plain_openclaw_home_inner(
     reject_overlapping_migration_paths(&source_home, &target_root)?;
     let target_paths = derive_env_paths(&target_root);
     let external_workspace_plan =
-        ExternalWorkspaceCopyPlan::for_migration(&source_home, &target_paths, env)?;
+        MigrationCopyPlan::for_migration(&source_home, &target_paths, env)?;
     let migrated_launcher = preflight_migrated_launcher(&env_name, env, cwd)?;
 
     // Keep custody of the provisional target through import and rollback.
@@ -521,7 +538,7 @@ fn complete_migration_import(
     created: crate::env::EnvMeta,
     target_paths: &crate::store::EnvPaths,
     source_home: &Path,
-    external_workspace_plan: &ExternalWorkspaceCopyPlan,
+    external_workspace_plan: &MigrationCopyPlan,
     sandbox_origin: Option<&str>,
     migrated_launcher: Option<&MigratedLauncherSpec>,
     env: &BTreeMap<String, String>,
@@ -537,17 +554,15 @@ fn complete_migration_import(
         std::path::absolute(source_home).map_err(|error| error.to_string())?;
     let source_home = absolute_source_home.as_path();
     let canonical_source_home = fs::canonicalize(source_home).map_err(|error| error.to_string())?;
-    let mut copied_configs = openclaw_config_include_paths(
-        &canonical_source_home.join("openclaw.json"),
-        &canonical_source_home,
-    )?
-    .iter()
-    .map(|path| {
-        path.strip_prefix(&canonical_source_home)
-            .map(|relative| target_paths.state_dir.join(relative))
-            .map_err(|error| error.to_string())
-    })
-    .collect::<Result<Vec<_>, _>>()?;
+    let mut copied_configs = external_workspace_plan
+        .config_include_paths
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&canonical_source_home)
+                .map(|relative| target_paths.state_dir.join(relative))
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut copying = OpenClawDirectoryCopy::new(source_home, source_home)?;
     copying.copy(source_home, &target_paths.state_dir)?;
     if !copied_configs.is_empty() {
@@ -555,7 +570,7 @@ fn complete_migration_import(
         copied_configs.push(target_paths.config_path.clone());
         rewrite_copied_config_include_directives(
             &copied_configs,
-            &[source_home.to_path_buf(), canonical_source_home.clone()],
+            &external_workspace_plan.source_config_roots,
             &target_paths.state_dir,
         )?;
     }
